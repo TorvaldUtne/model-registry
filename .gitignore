@@ -1,0 +1,7 @@
+config.json
+registry.db
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env

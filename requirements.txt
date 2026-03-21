@@ -1,0 +1,4 @@
+click>=8.0
+rich>=13.0
+requests>=2.28
+huggingface_hub>=0.20

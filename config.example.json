@@ -1,0 +1,26 @@
+{
+  "registry_db": "",
+  "backends": {
+    "ollama": {
+      "enabled": true,
+      "mode": "docker",
+      "docker_container": "ollama"
+    },
+    "llamacpp": {
+      "enabled": true,
+      "model_dir": "<PATH_TO_GGUF_DIRECTORY>",
+      "extensions": [".gguf"]
+    },
+    "comfyui": {
+      "enabled": false,
+      "model_dirs": {}
+    }
+  },
+  "huggingface": {
+    "token_env_var": "HF_TOKEN"
+  },
+  "display": {
+    "date_format": "%Y-%m-%d",
+    "max_name_width": 60
+  }
+}
