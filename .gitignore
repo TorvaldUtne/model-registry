@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+*.md
+*.code-workspace
+*.txt
