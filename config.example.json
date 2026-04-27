@@ -13,11 +13,15 @@
     },
     "comfyui": {
       "enabled": false,
-      "model_dirs": {}
+      "base_dir": "M:\\Programs\\ComfyUI\\ComfyUI\\models",
+      "extensions": [".safetensors", ".ckpt", ".pt", ".pth", ".bin"]
     }
   },
   "huggingface": {
     "token_env_var": "HF_TOKEN"
+  },
+  "civitai": {
+    "token_env_var": "CIVITAI_API_KEY"
   },
   "display": {
     "date_format": "%Y-%m-%d",

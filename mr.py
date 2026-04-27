@@ -84,7 +84,8 @@ def init_db(conn):
             architecture      TEXT,
             hf_downloads      INTEGER,
             hf_likes          INTEGER,
-            hf_last_modified  TEXT
+            hf_last_modified  TEXT,
+            source_url        TEXT
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -97,12 +98,36 @@ def init_db(conn):
     """)
     conn.commit()
 
+    # Migrations for columns added after initial release
+    for col, definition in [
+        ("source_url", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE models ADD COLUMN {col} {definition}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+
+# ─── DB helpers ───────────────────────────────────────────────────────────────
+
+def _last_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT last_insert_rowid()").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _scalar(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> int:
+    row = conn.execute(sql, params).fetchone()
+    assert row is not None
+    return row[0]
+
 
 # ─── Model matching ───────────────────────────────────────────────────────────
 
-def find_model(conn, name, *, prompt_on_multiple=True):
+def find_model(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
     """Return a single models row matching name (partial on display_name and ollama_name)."""
-    rows = conn.execute(
+    rows: list[sqlite3.Row] = conn.execute(
         """SELECT * FROM models
            WHERE display_name LIKE ? OR ollama_name LIKE ?
            ORDER BY display_name""",
@@ -111,7 +136,6 @@ def find_model(conn, name, *, prompt_on_multiple=True):
 
     if not rows:
         console.print(f"[red]No model matching '{name}' found.[/red]")
-        # Offer fuzzy suggestions from all names
         all_names = [r["display_name"] for r in conn.execute("SELECT display_name FROM models").fetchall()]
         name_lower = name.lower()
         suggestions = [n for n in all_names if any(c in n.lower() for c in name_lower)][:5]
@@ -123,9 +147,6 @@ def find_model(conn, name, *, prompt_on_multiple=True):
 
     if len(rows) == 1:
         return rows[0]
-
-    if not prompt_on_multiple:
-        return rows  # caller handles list
 
     console.print(f"[yellow]Multiple models match '{name}':[/yellow]")
     for i, row in enumerate(rows, 1):
@@ -211,10 +232,99 @@ def parse_variant_from_filename(filename):
     return None
 
 
+# ─── CivitAI / AIR helpers ───────────────────────────────────────────────────
+
+_CIVITAI_DOMAIN_RE = r"civitai\.(?:com|green|red)"
+
+# AIR type field → ComfyUI subdir name
+AIR_TYPE_TO_SUBDIR = {
+    "checkpoint": "checkpoints",
+    "model":      "checkpoints",
+    "vae":        "vae",
+    "lora":       "loras",
+    "locon":      "loras",
+    "lycoris":    "loras",
+    "embedding":  "embeddings",
+    "textualinversion": "embeddings",
+    "hypernet":   "hypernetworks",
+    "controlnet": "controlnet",
+    "upscaler":   "upscale_models",
+    "ipadapter":  "ipadapter",
+    "clipvision": "clip_vision",
+}
+
+
+def parse_air_tag(ref):
+    """Parse an AIR URN for a CivitAI resource. Returns dict or None.
+
+    Handles both full and shorthand forms per the spec (urn: and air: are optional):
+      urn:air:{ecosystem}:{type}:civitai:{model_id}@{version_id}
+      e.g. urn:air:sdxl:checkpoint:civitai:2218365@2741096
+           sdxl:checkpoint:civitai:2218365@2741096
+    """
+    # Strip optional urn: and air: prefixes
+    s = re.sub(r"^(?:urn:)?(?:air:)?", "", ref.strip(), flags=re.IGNORECASE)
+    m = re.match(
+        r"^([^:]+):([^:]+):civitai:(\d+)@(\d+)$",
+        s, re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return {
+        "ecosystem":  m.group(1).lower(),
+        "type":       m.group(2).lower(),
+        "model_id":   m.group(3),
+        "version_id": m.group(4),
+    }
+
+
+def parse_civitai_version_id(ref):
+    """Extract CivitAI version ID from an AIR tag, URL, or 'civitai:<id>' shorthand."""
+    air = parse_air_tag(ref)
+    if air:
+        return air["version_id"]
+    # civitai:12345
+    m = re.match(r"^civitai:(\d+)$", ref, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # https://civitai.com/api/download/models/12345  (also .green / .red)
+    m = re.search(_CIVITAI_DOMAIN_RE + r"/api/download/models/(\d+)", ref)
+    if m:
+        return m.group(1)
+    # https://civitai.com/models/12345?modelVersionId=67890  (also .green / .red)
+    m = re.search(r"[?&]modelVersionId=(\d+)", ref)
+    if m:
+        return m.group(1)
+    return None
+
+
+def civitai_source_url(ref, version_id, model_id=None):
+    """Return the value to store as source_url for a CivitAI download.
+
+    AIR tags are stored as-is (get_model_link converts them on read).
+    Model page URLs are normalized. civitai:NNN shorthand builds what it can.
+    """
+    if parse_air_tag(ref):
+        return ref  # store the AIR tag verbatim
+    if model_id:
+        return f"https://civitai.com/models/{model_id}?modelVersionId={version_id}"
+    if re.search(_CIVITAI_DOMAIN_RE + r"/models/", ref, re.IGNORECASE):
+        m = re.match(r"(https://" + _CIVITAI_DOMAIN_RE + r"/models/\d+(?:/[^?#]*)?)", ref, re.IGNORECASE)
+        base = m.group(1).rstrip("/") if m else "https://civitai.com/models"
+        return f"{base}?modelVersionId={version_id}"
+    # civitai:NNN or raw download URL — only version ID known
+    return f"https://civitai.com/models?modelVersionId={version_id}"
+
+
 # ─── Link helpers ────────────────────────────────────────────────────────────
 
 def get_model_link(row):
     """Return a browse URL for a model row, or None."""
+    if row["source_url"]:
+        air = parse_air_tag(row["source_url"])
+        if air:
+            return f"https://civitai.com/models/{air['model_id']}?modelVersionId={air['version_id']}"
+        return row["source_url"]
     if row["hf_repo"]:
         return f"https://huggingface.co/{row['hf_repo']}"
     if row["backend"] == "ollama":
@@ -233,7 +343,84 @@ STATUS_COLORS = {
     "blacklisted": "red",
     "deleted": "dim",
     "on_hold": "yellow",
+    "testing": "cyan",
+    "keep": "green",
+    "favorite": "magenta",
 }
+
+
+# ─── ComfyUI scan ────────────────────────────────────────────────────────────
+
+def scan_comfyui(config, conn):
+    """Scan all immediate subdirs of the ComfyUI models base_dir. Returns (added, updated)."""
+    comfy_cfg = config["backends"].get("comfyui", {})
+    base_dir = Path(comfy_cfg.get("base_dir", ""))
+    extensions = comfy_cfg.get("extensions", [".safetensors", ".ckpt", ".pt", ".pth", ".bin"])
+    now = now_iso()
+    added = updated = 0
+
+    if not base_dir.exists():
+        console.print(f"[red]ComfyUI base_dir does not exist: {base_dir}[/red]")
+        return added, updated
+
+    subdirs = [d for d in base_dir.iterdir() if d.is_dir()]
+    if not subdirs:
+        console.print(f"  [yellow]No subdirectories found in {base_dir}[/yellow]")
+        return added, updated
+
+    seen_paths = set()
+    for subdir in sorted(subdirs):
+        variant = subdir.name
+        files = []
+        for ext in extensions:
+            files.extend(subdir.glob(f"*{ext}"))
+        for f in sorted(files):
+            fpath = str(f)
+            seen_paths.add(fpath)
+            size_gb = round(f.stat().st_size / (1024 ** 3), 4)
+
+            existing = conn.execute(
+                "SELECT * FROM models WHERE file_path=?", (fpath,)
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    "UPDATE models SET size_gb=?, currently_local=1, last_updated=? WHERE id=?",
+                    (size_gb, now, existing["id"]),
+                )
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (existing["id"], "scan_updated", now, json.dumps({"size_gb": size_gb})),
+                )
+                updated += 1
+            else:
+                conn.execute(
+                    """INSERT INTO models
+                       (display_name, variant, backend, source_type,
+                        file_path, size_gb, currently_local, first_seen, last_updated)
+                       VALUES (?,?,?,?,?,?,1,?,?)""",
+                    (f.stem, variant, "comfyui", "comfyui_unknown", fpath, size_gb, now, now),
+                )
+                mid = _last_id(conn)
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (mid, "scan_added", now, json.dumps({"file_path": fpath})),
+                )
+                added += 1
+
+    # Mark disappeared files as not-local
+    db_comfy = conn.execute(
+        "SELECT id, file_path FROM models WHERE backend='comfyui' AND currently_local=1"
+    ).fetchall()
+    for row in db_comfy:
+        if row["file_path"] not in seen_paths:
+            conn.execute(
+                "UPDATE models SET currently_local=0, last_updated=? WHERE id=?",
+                (now, row["id"]),
+            )
+            console.print(f"  [yellow]Marked not-local: {row['file_path']}[/yellow]")
+
+    return added, updated
 
 
 # ─── CLI group ────────────────────────────────────────────────────────────────
@@ -307,6 +494,25 @@ def init():
         else:
             console.print(f"[yellow]⚠ GGUF directory not found: {p}[/yellow]")
 
+    # ComfyUI setup
+    comfyui_enabled = click.confirm("\nEnable ComfyUI backend?", default=False)
+    comfyui_base_dir = ""
+    if comfyui_enabled:
+        default_comfy = defaults.get("backends", {}).get("comfyui", {}).get(
+            "base_dir", r"M:\Programs\ComfyUI\ComfyUI\models"
+        )
+        comfyui_base_dir = click.prompt("ComfyUI models base directory", default=default_comfy)
+        p = Path(comfyui_base_dir)
+        if p.exists() and p.is_dir():
+            console.print(f"[green]✓ ComfyUI models directory exists: {p}[/green]")
+        else:
+            console.print(f"[yellow]⚠ ComfyUI directory not found: {p}[/yellow]")
+
+    civitai_env_var = click.prompt(
+        "CivitAI token environment variable name (leave blank to skip)",
+        default=defaults.get("civitai", {}).get("token_env_var", "CIVITAI_API_KEY"),
+    )
+
     config = {
         "registry_db": db_path,
         "backends": {
@@ -321,12 +527,16 @@ def init():
                 "extensions": [".gguf"],
             },
             "comfyui": {
-                "enabled": False,
-                "model_dirs": {},
+                "enabled": comfyui_enabled,
+                "base_dir": comfyui_base_dir,
+                "extensions": [".safetensors", ".ckpt", ".pt", ".pth", ".bin"],
             },
         },
         "huggingface": {
             "token_env_var": hf_env_var,
+        },
+        "civitai": {
+            "token_env_var": civitai_env_var,
         },
         "display": {
             "date_format": "%Y-%m-%d",
@@ -349,7 +559,7 @@ def init():
 
 @cli.command()
 def scan():
-    """Scan Ollama and llama.cpp backends, update the registry."""
+    """Scan Ollama, llama.cpp, and ComfyUI backends, update the registry."""
     config = load_config()
     conn = get_db(config)
     init_db(conn)
@@ -417,7 +627,7 @@ def scan():
                            VALUES (?,?,?,?,?,?,?,1,?,?)""",
                         (oname, hf_repo, variant, "ollama", source_type, oname, size_gb, now, now),
                     )
-                    mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    mid = _last_id(conn)
                     conn.execute(
                         "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
                         (mid, "scan_added", now, json.dumps({"ollama_name": oname})),
@@ -464,7 +674,7 @@ def scan():
             for f in sorted(files):
                 fpath = str(f)
                 seen_paths.add(fpath)
-                size_gb = round(f.stat().st_size / (1024 ** 3), 2)
+                size_gb = round(f.stat().st_size / (1024 ** 3), 4)
                 variant = parse_variant_from_filename(f.name)
 
                 existing = conn.execute(
@@ -490,7 +700,7 @@ def scan():
                            VALUES (?,?,?,?,?,?,1,?,?)""",
                         (display_name, variant, "llamacpp", "llamacpp", fpath, size_gb, now, now),
                     )
-                    mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    mid = _last_id(conn)
                     conn.execute(
                         "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
                         (mid, "scan_added", now, json.dumps({"file_path": fpath})),
@@ -509,6 +719,16 @@ def scan():
                     )
                     console.print(f"  [yellow]Marked not-local: {row['file_path']}[/yellow]")
 
+    # ── ComfyUI ──────────────────────────────────────────────────────────────
+    comfy_cfg = config["backends"].get("comfyui", {})
+    if comfy_cfg.get("enabled", False):
+        base_dir = comfy_cfg.get("base_dir", "")
+        console.print(f"\nScanning ComfyUI models in [bold]{base_dir}[/bold]...")
+        c_added, c_updated = scan_comfyui(config, conn)
+        added += c_added
+        updated += c_updated
+        console.print(f"  ComfyUI: [green]{c_added}[/green] added, [cyan]{c_updated}[/cyan] updated")
+
     conn.commit()
     conn.close()
     console.print(
@@ -520,20 +740,23 @@ def scan():
 # ─── list ─────────────────────────────────────────────────────────────────────
 
 @cli.command("list")
-@click.option("--backend", type=click.Choice(["ollama", "llamacpp"]), default=None)
+@click.option("--backend", type=click.Choice(["ollama", "llamacpp", "comfyui"]), default=None)
 @click.option(
     "--status",
-    type=click.Choice(["active", "unrated", "blacklisted", "deleted", "on_hold"]),
+    type=click.Choice(["active", "unrated", "blacklisted", "deleted", "on_hold", "testing", "keep", "favorite"]),
     default=None,
 )
 @click.option("--unrated", is_flag=True, default=False, help="Show only models with no rating")
-def list_models(backend, status, unrated):
-    """List models in the registry."""
+@click.option("--all", "show_all", is_flag=True, default=False, help="Include non-local and blacklisted models")
+def list_models(backend, status, unrated, show_all):
+    """List models in the registry. By default shows only locally installed, non-blacklisted models."""
     config = load_config()
     conn = get_db(config)
 
     query = "SELECT * FROM models WHERE 1=1"
     params = []
+    if not show_all:
+        query += " AND currently_local=1 AND status != 'blacklisted'"
     if backend:
         query += " AND backend=?"
         params.append(backend)
@@ -555,7 +778,10 @@ def list_models(backend, status, unrated):
 
     table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan")
     table.add_column("Name", no_wrap=True)
-    table.add_column("Backend", width=9)
+    if backend != "comfyui":
+        table.add_column("Backend", width=9)
+    if backend == "comfyui":
+        table.add_column("Type", width=14)
     table.add_column("Status", width=12)
     table.add_column("Rating", width=7, justify="center")
     table.add_column("Size", width=9, justify="right")
@@ -565,7 +791,12 @@ def list_models(backend, status, unrated):
         status_val = row["status"] or "unrated"
         color = STATUS_COLORS.get(status_val, "white")
         rating_str = f"{row['rating']}/5" if row["rating"] else "-"
-        size_str = f"{row['size_gb']:.1f} GB" if row["size_gb"] else "-"
+        if row["size_gb"] is None:
+            size_str = "-"
+        elif row["size_gb"] < 0.1:
+            size_str = f"{row['size_gb'] * 1024:.0f} MB"
+        else:
+            size_str = f"{row['size_gb']:.1f} GB"
 
         last_used = row["last_used"]
         if last_used:
@@ -576,14 +807,18 @@ def list_models(backend, status, unrated):
                 pass
 
         not_local = "" if row["currently_local"] else " [dim](not local)[/dim]"
-        table.add_row(
-            f"[{color}]{row['display_name']}{not_local}[/{color}]",
-            row["backend"],
+        row_cells = [f"[{color}]{row['display_name']}{not_local}[/{color}]"]
+        if backend != "comfyui":
+            row_cells.append(row["backend"])
+        if backend == "comfyui":
+            row_cells.append(row["variant"] or "-")
+        row_cells += [
             f"[{color}]{status_val}[/{color}]",
             rating_str,
             size_str,
             last_used or "-",
-        )
+        ]
+        table.add_row(*row_cells)
 
     console.print(table)
     console.print(f"[dim]{len(rows)} model(s)[/dim]")
@@ -625,7 +860,7 @@ def show(model):
         lines.append(f"[bold]Ollama:[/bold]     {row['ollama_name']}")
     if row["file_path"]:
         lines.append(f"[bold]File:[/bold]       {row['file_path']}")
-    lines.append(f"[bold]Size:[/bold]       {row['size_gb']:.2f} GB" if row["size_gb"] else "[bold]Size:[/bold]       -")
+    lines.append(f"[bold]Size:[/bold]       {row['size_gb']:.2f} GB" if row["size_gb"] is not None else "[bold]Size:[/bold]       -")
     lines.append(f"[bold]Local:[/bold]      {'yes' if row['currently_local'] else 'no'}")
     lines.append(f"[bold]Downloads:[/bold]  {row['times_downloaded']}")
     if tags:
@@ -692,7 +927,7 @@ def rate(model):
     new_rating = click.prompt("Rating (1-5)", type=click.IntRange(1, 5))
     new_status = click.prompt(
         "Status",
-        type=click.Choice(["active", "unrated", "blacklisted", "deleted", "on_hold"]),
+        type=click.Choice(["active", "unrated", "blacklisted", "deleted", "on_hold", "testing", "keep", "favorite"]),
         default=row["status"] or "active",
     )
     note_text = click.prompt("Note (blank to skip)", default="", show_default=False)
@@ -718,6 +953,31 @@ def rate(model):
     conn.commit()
     conn.close()
     console.print(f"[green]✓ Rated {new_rating}/5, status: {new_status}[/green]")
+
+
+# ─── status ───────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("model")
+@click.argument("status", type=click.Choice(["active", "unrated", "blacklisted", "deleted", "on_hold", "testing", "keep", "favorite"]))
+def status(model, status):
+    """Set a model's status without requiring a rating."""
+    config = load_config()
+    conn = get_db(config)
+    row = find_model(conn, model)
+    now = now_iso()
+
+    conn.execute(
+        "UPDATE models SET status=?, last_updated=? WHERE id=?",
+        (status, now, row["id"]),
+    )
+    conn.execute(
+        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+        (row["id"], "setstatus", now, json.dumps({"status": status})),
+    )
+    conn.commit()
+    conn.close()
+    console.print(f"[green]✓ Status set to: {status}[/green]")
 
 
 # ─── note ─────────────────────────────────────────────────────────────────────
@@ -782,10 +1042,8 @@ def report():
     config = load_config()
     conn = get_db(config)
 
-    total = conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
-    total_gb = conn.execute(
-        "SELECT SUM(size_gb) FROM models WHERE currently_local=1"
-    ).fetchone()[0] or 0
+    total = _scalar(conn, "SELECT COUNT(*) FROM models")
+    total_gb = _scalar(conn, "SELECT COALESCE(SUM(size_gb), 0) FROM models WHERE currently_local=1")
 
     by_backend = conn.execute(
         """SELECT backend, COUNT(*) as cnt, SUM(size_gb) as gb
@@ -831,7 +1089,7 @@ def report():
     if unrated:
         console.print(f"\n[bold]Unrated Models ({len(unrated)}):[/bold]")
         for r in unrated:
-            size_str = f"  {r['size_gb']:.1f} GB" if r["size_gb"] else ""
+            size_str = f"  {r['size_gb']:.1f} GB" if r["size_gb"] is not None else ""
             console.print(f"  [{r['backend']}] {r['display_name']}{size_str}")
 
     if blacklisted:
@@ -848,9 +1106,7 @@ def report():
             console.print(f"    {r['names']}")
     else:
         console.print("\n[dim]No cross-backend duplicates detected.[/dim]")
-        no_hf = conn.execute(
-            "SELECT COUNT(*) FROM models WHERE backend='llamacpp' AND hf_repo IS NULL AND currently_local=1"
-        ).fetchone()[0]
+        no_hf = _scalar(conn, "SELECT COUNT(*) FROM models WHERE backend='llamacpp' AND hf_repo IS NULL AND currently_local=1")
         if no_hf:
             console.print(
                 f"[dim]  ({no_hf} llamacpp model(s) have no hf_repo — "
@@ -864,10 +1120,15 @@ def report():
 
 @cli.command()
 @click.argument("ref")
-@click.option("--backend", type=click.Choice(["ollama", "llamacpp"]), default=None)
-@click.option("--file", "file_pattern", default=None, help="Glob pattern for GGUF file in HF repo")
-def pull(ref, backend, file_pattern):
-    """Pull a model. Warns if blacklisted or previously deleted."""
+@click.option("--backend", type=click.Choice(["ollama", "llamacpp", "comfyui"]), default=None)
+@click.option("--file", "file_pattern", default=None, help="Glob pattern for file in HF repo")
+@click.option("--subdir", default=None, help="ComfyUI subdir to save into (e.g. checkpoints, loras)")
+def pull(ref, backend, file_pattern, subdir):
+    """Pull a model. Warns if blacklisted or previously deleted.
+
+    For ComfyUI models, --subdir is required. Supports HuggingFace repos
+    (org/repo format) and CivitAI downloads (civitai:<versionId> or CivitAI URL).
+    """
     config = load_config()
     conn = get_db(config)
     init_db(conn)
@@ -875,7 +1136,12 @@ def pull(ref, backend, file_pattern):
 
     # Auto-detect backend
     if backend is None:
-        backend = "llamacpp" if ref.endswith(".gguf") else "ollama"
+        if ref.endswith(".gguf") or (parse_civitai_version_id(ref) is None and "/" not in ref):
+            backend = "ollama"
+        elif parse_civitai_version_id(ref) is not None:
+            backend = "comfyui"
+        else:
+            backend = "llamacpp" if ref.endswith(".gguf") else "ollama"
 
     # Pre-pull: check if blacklisted or deleted
     hf_repo, _ = parse_hf_repo_from_ollama(ref)
@@ -945,7 +1211,7 @@ def pull(ref, backend, file_pattern):
                    VALUES (?,?,?,?,?,?,1,1,?,?,?)""",
                 (ref, hf_repo2, variant2, "ollama", source_type, ref, now, now, now),
             )
-            mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            mid = _last_id(conn)
 
         conn.execute(
             "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
@@ -1029,7 +1295,7 @@ def pull(ref, backend, file_pattern):
                 (local_path.stem, repo_id, variant, "llamacpp", "llamacpp",
                  str(local_path), size_gb, now, now, now),
             )
-            mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            mid = _last_id(conn)
 
         conn.execute(
             "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
@@ -1039,6 +1305,221 @@ def pull(ref, backend, file_pattern):
         console.print(
             f"[green]✓ Downloaded to {local_path} ({size_gb:.2f} GB). Registry updated.[/green]"
         )
+
+    # ── ComfyUI download (HuggingFace or CivitAI) ────────────────────────────
+    elif backend == "comfyui":
+        comfy_cfg = config["backends"].get("comfyui", {})
+        base_dir = Path(comfy_cfg.get("base_dir", ""))
+        if not base_dir.exists():
+            console.print(f"[red]ComfyUI base_dir does not exist: {base_dir}[/red]")
+            conn.close()
+            return
+
+        if not subdir:
+            # Auto-detect from AIR tag type field
+            air = parse_air_tag(ref)
+            if air:
+                subdir = AIR_TYPE_TO_SUBDIR.get(air["type"])
+                if subdir:
+                    console.print(f"  Auto-detected subdir [bold]{subdir}[/bold] from AIR type '{air['type']}'")
+        if not subdir:
+            subdir = click.prompt("ComfyUI subdir (e.g. checkpoints, loras, vae)")
+
+        dest_dir = base_dir / subdir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        civitai_version_id = parse_civitai_version_id(ref)
+
+        if civitai_version_id:
+            # ── CivitAI download ─────────────────────────────────────────────
+            try:
+                import requests as _requests
+            except ImportError:
+                console.print("[red]requests not installed. Run: pip install requests[/red]")
+                conn.close()
+                return
+
+            civitai_cfg = config.get("civitai", {})
+            token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
+            civitai_token = os.environ.get(token_env)
+
+            # Token must be a query param — Authorization header is stripped on CDN redirect
+            _dm = re.search(_CIVITAI_DOMAIN_RE, ref)
+            _civitai_host = _dm.group(0) if _dm else "civitai.com"
+            download_url = f"https://{_civitai_host}/api/download/models/{civitai_version_id}"
+            params = {}
+            if civitai_token:
+                params["token"] = civitai_token
+            else:
+                console.print("[yellow]⚠ No CivitAI API key found. Download may fail for gated models.[/yellow]")
+
+            console.print(f"Downloading from CivitAI (version {civitai_version_id})...")
+            resp = _requests.get(download_url, params=params, stream=True, timeout=(30, None))
+            if resp.status_code == 401:
+                console.print(f"[red]CivitAI download failed: unauthorized. Check your {token_env} env var.[/red]")
+                conn.close()
+                return
+            if resp.status_code != 200:
+                console.print(f"[red]CivitAI download failed (HTTP {resp.status_code})[/red]")
+                conn.close()
+                return
+
+            # Get filename from Content-Disposition header
+            cd = resp.headers.get("Content-Disposition", "")
+            filename_match = re.search(r'filename="?([^";\r\n]+)"?', cd)
+            if filename_match:
+                filename = filename_match.group(1).strip()
+            else:
+                filename = click.prompt("Filename to save as (no path)")
+
+            local_path = dest_dir / filename
+            total = int(resp.headers.get("Content-Length", 0)) or None
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task(f"Downloading {filename}", total=total)
+                with open(local_path, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        fh.write(chunk)
+                        progress.advance(task, len(chunk))
+
+            size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
+            fpath = str(local_path)
+
+            air = parse_air_tag(ref)
+            civitai_url = civitai_source_url(ref, civitai_version_id, air["model_id"] if air else None)
+
+            # Check if already in DB by file_path
+            existing_by_path = conn.execute(
+                "SELECT * FROM models WHERE file_path=?", (fpath,)
+            ).fetchone()
+            if existing_by_path or existing:
+                row_to_update = existing_by_path or existing
+                conn.execute(
+                    """UPDATE models
+                       SET currently_local=1, times_downloaded=times_downloaded+1,
+                           file_path=?, size_gb=?, last_used=?, last_updated=?,
+                           source_type='comfyui_civitai', source_url=?
+                       WHERE id=?""",
+                    (fpath, size_gb, now, now, civitai_url, row_to_update["id"]),
+                )
+                mid = row_to_update["id"]
+            else:
+                conn.execute(
+                    """INSERT INTO models
+                       (display_name, variant, backend, source_type, source_url,
+                        file_path, size_gb, currently_local, times_downloaded,
+                        first_seen, last_used, last_updated)
+                       VALUES (?,?,?,?,?,?,?,1,1,?,?,?)""",
+                    (local_path.stem, subdir, "comfyui", "comfyui_civitai", civitai_url,
+                     fpath, size_gb, now, now, now),
+                )
+                mid = _last_id(conn)
+
+            conn.execute(
+                "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                (mid, "pull", now, json.dumps({"civitai_version_id": civitai_version_id, "file": filename})),
+            )
+            conn.commit()
+            console.print(
+                f"[green]✓ Downloaded to {local_path} ({size_gb:.2f} GB). Registry updated.[/green]"
+            )
+
+        else:
+            # ── HuggingFace download to ComfyUI subdir ───────────────────────
+            try:
+                from huggingface_hub import hf_hub_download, list_repo_files
+            except ImportError:
+                console.print("[red]huggingface_hub not installed. Run: pip install huggingface_hub[/red]")
+                conn.close()
+                return
+
+            token_env = config["huggingface"]["token_env_var"]
+            token = os.environ.get(token_env)
+            repo_id = ref
+
+            if "/" not in repo_id:
+                console.print("[red]For HuggingFace, ref must be 'org/repo' format.[/red]")
+                conn.close()
+                return
+
+            comfy_exts = tuple(comfy_cfg.get("extensions", [".safetensors", ".ckpt", ".pt", ".pth", ".bin"]))
+            all_files = list(list_repo_files(repo_id, token=token))
+            model_files = [f for f in all_files if f.lower().endswith(comfy_exts)]
+
+            if not model_files:
+                console.print(f"[red]No model files found in {repo_id}[/red]")
+                conn.close()
+                return
+
+            if file_pattern:
+                matches = [f for f in model_files if fnmatch.fnmatch(f, file_pattern)]
+                if not matches:
+                    console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
+                    conn.close()
+                    return
+                chosen_file = matches[0]
+            elif len(model_files) == 1:
+                chosen_file = model_files[0]
+            else:
+                console.print(f"Multiple model files in [bold]{repo_id}[/bold]:")
+                for i, f in enumerate(model_files, 1):
+                    console.print(f"  {i}. {f}")
+                idx = click.prompt("Pick a number", type=click.IntRange(1, len(model_files)))
+                chosen_file = model_files[idx - 1]
+
+            console.print(f"Downloading [bold]{chosen_file}[/bold] from {repo_id}...")
+            local_path = Path(
+                hf_hub_download(
+                    repo_id=repo_id,
+                    filename=chosen_file,
+                    local_dir=str(dest_dir),
+                    token=token,
+                )
+            )
+
+            size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
+            fpath = str(local_path)
+
+            existing_by_path = conn.execute(
+                "SELECT * FROM models WHERE file_path=?", (fpath,)
+            ).fetchone()
+            if existing_by_path or existing:
+                row_to_update = existing_by_path or existing
+                conn.execute(
+                    """UPDATE models
+                       SET currently_local=1, times_downloaded=times_downloaded+1,
+                           file_path=?, size_gb=?, hf_repo=?, last_used=?, last_updated=?,
+                           source_type='comfyui_hf'
+                       WHERE id=?""",
+                    (fpath, size_gb, repo_id, now, now, row_to_update["id"]),
+                )
+                mid = row_to_update["id"]
+            else:
+                conn.execute(
+                    """INSERT INTO models
+                       (display_name, hf_repo, variant, backend, source_type,
+                        file_path, size_gb, currently_local, times_downloaded,
+                        first_seen, last_used, last_updated)
+                       VALUES (?,?,?,?,?,?,?,1,1,?,?,?)""",
+                    (local_path.stem, repo_id, subdir, "comfyui", "comfyui_hf",
+                     fpath, size_gb, now, now, now),
+                )
+                mid = _last_id(conn)
+
+            conn.execute(
+                "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                (mid, "pull", now, json.dumps({"repo_id": repo_id, "file": chosen_file})),
+            )
+            conn.commit()
+            console.print(
+                f"[green]✓ Downloaded to {local_path} ({size_gb:.2f} GB). Registry updated.[/green]"
+            )
 
     conn.close()
 
@@ -1070,7 +1551,7 @@ def delete(model):
             return
         console.print("[green]✓ Removed from Ollama.[/green]")
 
-    elif row["backend"] == "llamacpp":
+    elif row["backend"] in ("llamacpp", "comfyui"):
         if row["file_path"]:
             p = Path(row["file_path"])
             if p.exists():
@@ -1124,7 +1605,7 @@ def blacklist(model, reason):
             return
         hf_repo, variant = parse_hf_repo_from_ollama(model)
         backend = click.prompt(
-            "Backend", type=click.Choice(["ollama", "llamacpp"]), default="ollama"
+            "Backend", type=click.Choice(["ollama", "llamacpp", "comfyui"]), default="ollama"
         )
         conn.execute(
             """INSERT INTO models
@@ -1134,7 +1615,7 @@ def blacklist(model, reason):
             (model, hf_repo, variant, backend, get_source_type(model),
              model if backend == "ollama" else None, now, now),
         )
-        mid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        mid = _last_id(conn)
         row = conn.execute("SELECT * FROM models WHERE id=?", (mid,)).fetchone()
     elif len(rows) == 1:
         row = rows[0]
@@ -1170,7 +1651,7 @@ def blacklist(model, reason):
                 console.print("[green]✓ Removed from Ollama.[/green]")
             else:
                 console.print(f"[yellow]⚠ Ollama delete failed: {result.stderr.strip()}[/yellow]")
-        elif row["backend"] == "llamacpp" and row["file_path"]:
+        elif row["backend"] in ("llamacpp", "comfyui") and row["file_path"]:
             p = Path(row["file_path"])
             if p.exists():
                 p.unlink()
@@ -1318,7 +1799,7 @@ def search(term):
     for row in rows:
         color = STATUS_COLORS.get(row["status"] or "unrated", "white")
         rating_str = f"{row['rating']}/5" if row["rating"] else "unrated"
-        size_str = f"  {row['size_gb']:.1f} GB" if row["size_gb"] else ""
+        size_str = f"  {row['size_gb']:.1f} GB" if row["size_gb"] is not None else ""
         console.print(
             f"[{color}]{row['display_name']}[/{color}]  "
             f"[dim][{row['backend']}][/dim]  {rating_str}{size_str}"

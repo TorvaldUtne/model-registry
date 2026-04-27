@@ -5,6 +5,14 @@ __pycache__/
 *.pyc
 *.pyo
 .env
-*.md
 *.code-workspace
+.claude/
+
+# Exclude planning/notes docs but keep CLAUDE.md and README.md
+*.md
+!CLAUDE.md
+!README.md
+
+# Exclude text files but keep requirements.txt
 *.txt
+!requirements.txt
