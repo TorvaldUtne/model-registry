@@ -1232,10 +1232,14 @@ def pull(ref, backend, file_pattern, subdir):
         model_dir = Path(config["backends"]["llamacpp"]["model_dir"])
         token_env = config["huggingface"]["token_env_var"]
         token = os.environ.get(token_env)
-        repo_id = ref
+
+        parsed_repo, parsed_variant = parse_hf_repo_from_ollama(ref)
+        repo_id = parsed_repo if parsed_repo else ref
+        if parsed_variant and not file_pattern:
+            file_pattern = f"*{parsed_variant}*.gguf"
 
         if "/" not in repo_id:
-            console.print("[red]For llamacpp, ref must be 'org/repo' format.[/red]")
+            console.print("[red]For llamacpp, ref must be 'org/repo' or 'hf.co/org/repo:tag' format.[/red]")
             conn.close()
             return
 
