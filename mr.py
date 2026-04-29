@@ -85,7 +85,9 @@ def init_db(conn):
             hf_downloads      INTEGER,
             hf_likes          INTEGER,
             hf_last_modified  TEXT,
-            source_url        TEXT
+            source_url        TEXT,
+            base_model        TEXT,
+            trigger_words     TEXT
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -100,7 +102,9 @@ def init_db(conn):
 
     # Migrations for columns added after initial release
     for col, definition in [
-        ("source_url", "TEXT"),
+        ("source_url",    "TEXT"),
+        ("base_model",    "TEXT"),
+        ("trigger_words", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE models ADD COLUMN {col} {definition}")
@@ -253,6 +257,20 @@ AIR_TYPE_TO_SUBDIR = {
     "clipvision": "clip_vision",
 }
 
+# CivitAI API model type field → ComfyUI subdir name
+CIVITAI_API_TYPE_TO_SUBDIR = {
+    "checkpoint":        "checkpoints",
+    "textualinversion":  "embeddings",
+    "hypernetwork":      "hypernetworks",
+    "lora":              "loras",
+    "locon":             "loras",
+    "controlnet":        "controlnet",
+    "upscaler":          "upscale_models",
+    "motionmodule":      "animatediff_models",
+    "vae":               "vae",
+    "poses":             "poses",
+}
+
 
 def parse_air_tag(ref):
     """Parse an AIR URN for a CivitAI resource. Returns dict or None.
@@ -296,6 +314,37 @@ def parse_civitai_version_id(ref):
     if m:
         return m.group(1)
     return None
+
+
+def parse_civitai_model_id(ref):
+    """Extract the model ID from a CivitAI browse URL (any domain variant)."""
+    m = re.search(_CIVITAI_DOMAIN_RE + r"/models/(\d+)", ref, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def fetch_civitai_model_info(model_id, token=None, host="civitai.com"):
+    """Call CivitAI API v1 for a model. Returns (version_id, subdir_hint) or (None, None)."""
+    try:
+        import requests as _requests
+    except ImportError:
+        return None, None
+    url = f"https://{host}/api/v1/models/{model_id}"
+    params = {}
+    if token:
+        params["token"] = token
+    try:
+        resp = _requests.get(url, params=params, timeout=15)
+        if resp.status_code != 200:
+            return None, None
+        data = resp.json()
+    except Exception:
+        return None, None
+    # Default/latest version is first in the list
+    versions = data.get("modelVersions", [])
+    version_id = str(versions[0]["id"]) if versions else None
+    api_type = (data.get("type") or "").lower().replace(" ", "")
+    subdir = CIVITAI_API_TYPE_TO_SUBDIR.get(api_type)
+    return version_id, subdir
 
 
 def civitai_source_url(ref, version_id, model_id=None):
@@ -887,6 +936,18 @@ def show(model):
         if row["hf_last_modified"]:
             lines.append(f"[bold]HF updated:[/bold] {row['hf_last_modified']}")
 
+    if row["base_model"] or row["trigger_words"]:
+        lines.append("")
+        lines.append("[bold dim]─── CivitAI Metadata ───[/bold dim]")
+        if row["base_model"]:
+            lines.append(f"[bold]Base model:[/bold] {row['base_model']}")
+        if row["trigger_words"]:
+            try:
+                words = json.loads(row["trigger_words"])
+            except Exception:
+                words = [row["trigger_words"]]
+            lines.append(f"[bold]Triggers:[/bold]   {', '.join(words)}")
+
     if row["notes"]:
         lines.append("")
         lines.append("[bold dim]─── Notes ───[/bold dim]")
@@ -1136,12 +1197,12 @@ def pull(ref, backend, file_pattern, subdir):
 
     # Auto-detect backend
     if backend is None:
-        if ref.endswith(".gguf") or (parse_civitai_version_id(ref) is None and "/" not in ref):
-            backend = "ollama"
-        elif parse_civitai_version_id(ref) is not None:
+        if parse_civitai_version_id(ref) is not None:
             backend = "comfyui"
+        elif ref.endswith(".gguf") or ("/" in ref and not re.search(r"(?:hf\.co|huggingface\.co)/", ref, re.IGNORECASE)):
+            backend = "llamacpp"
         else:
-            backend = "llamacpp" if ref.endswith(".gguf") else "ollama"
+            backend = "ollama"
 
     # Pre-pull: check if blacklisted or deleted
     hf_repo, _ = parse_hf_repo_from_ollama(ref)
@@ -1319,6 +1380,27 @@ def pull(ref, backend, file_pattern, subdir):
             conn.close()
             return
 
+        civitai_cfg = config.get("civitai", {})
+        token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
+        civitai_token = os.environ.get(token_env)
+
+        civitai_version_id = parse_civitai_version_id(ref)
+        _civitai_model_id = parse_civitai_model_id(ref)
+
+        # Browse URL with model ID but no version ID — resolve via API
+        if civitai_version_id is None and _civitai_model_id:
+            _dm = re.search(_CIVITAI_DOMAIN_RE, ref)
+            _host = _dm.group(0) if _dm else "civitai.com"
+            console.print(f"Fetching model info from CivitAI API (model {_civitai_model_id})...")
+            civitai_version_id, _api_subdir = fetch_civitai_model_info(
+                _civitai_model_id, token=civitai_token, host=_host
+            )
+            if civitai_version_id:
+                console.print(f"  Using latest version [bold]{civitai_version_id}[/bold]")
+            if not subdir and _api_subdir:
+                subdir = _api_subdir
+                console.print(f"  Auto-detected subdir [bold]{subdir}[/bold] from CivitAI model type")
+
         if not subdir:
             # Auto-detect from AIR tag type field
             air = parse_air_tag(ref)
@@ -1332,8 +1414,6 @@ def pull(ref, backend, file_pattern, subdir):
         dest_dir = base_dir / subdir
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        civitai_version_id = parse_civitai_version_id(ref)
-
         if civitai_version_id:
             # ── CivitAI download ─────────────────────────────────────────────
             try:
@@ -1342,10 +1422,6 @@ def pull(ref, backend, file_pattern, subdir):
                 console.print("[red]requests not installed. Run: pip install requests[/red]")
                 conn.close()
                 return
-
-            civitai_cfg = config.get("civitai", {})
-            token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
-            civitai_token = os.environ.get(token_env)
 
             # Token must be a query param — Authorization header is stripped on CDN redirect
             _dm = re.search(_CIVITAI_DOMAIN_RE, ref)
@@ -1445,47 +1521,59 @@ def pull(ref, backend, file_pattern, subdir):
 
             token_env = config["huggingface"]["token_env_var"]
             token = os.environ.get(token_env)
-            repo_id = ref
 
-            if "/" not in repo_id:
-                console.print("[red]For HuggingFace, ref must be 'org/repo' format.[/red]")
-                conn.close()
-                return
+            # Detect full HF resolve URLs: https://huggingface.co/org/repo/resolve/ref/path/file
+            _hf_resolve = re.match(
+                r"https://huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.+)$",
+                ref, re.IGNORECASE,
+            )
+            if _hf_resolve:
+                repo_id     = _hf_resolve.group(1)
+                revision    = _hf_resolve.group(2)
+                chosen_file = _hf_resolve.group(3)
+                console.print(
+                    f"Downloading [bold]{chosen_file}[/bold] from {repo_id} @ {revision}..."
+                )
+            else:
+                repo_id  = ref
+                revision = None
 
-            comfy_exts = tuple(comfy_cfg.get("extensions", [".safetensors", ".ckpt", ".pt", ".pth", ".bin"]))
-            all_files = list(list_repo_files(repo_id, token=token))
-            model_files = [f for f in all_files if f.lower().endswith(comfy_exts)]
-
-            if not model_files:
-                console.print(f"[red]No model files found in {repo_id}[/red]")
-                conn.close()
-                return
-
-            if file_pattern:
-                matches = [f for f in model_files if fnmatch.fnmatch(f, file_pattern)]
-                if not matches:
-                    console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
+                if "/" not in repo_id:
+                    console.print("[red]For HuggingFace, ref must be 'org/repo' format or a full resolve URL.[/red]")
                     conn.close()
                     return
-                chosen_file = matches[0]
-            elif len(model_files) == 1:
-                chosen_file = model_files[0]
-            else:
-                console.print(f"Multiple model files in [bold]{repo_id}[/bold]:")
-                for i, f in enumerate(model_files, 1):
-                    console.print(f"  {i}. {f}")
-                idx = click.prompt("Pick a number", type=click.IntRange(1, len(model_files)))
-                chosen_file = model_files[idx - 1]
 
-            console.print(f"Downloading [bold]{chosen_file}[/bold] from {repo_id}...")
-            local_path = Path(
-                hf_hub_download(
-                    repo_id=repo_id,
-                    filename=chosen_file,
-                    local_dir=str(dest_dir),
-                    token=token,
-                )
-            )
+                comfy_exts = tuple(comfy_cfg.get("extensions", [".safetensors", ".ckpt", ".pt", ".pth", ".bin"]))
+                all_files = list(list_repo_files(repo_id, token=token))
+                model_files = [f for f in all_files if f.lower().endswith(comfy_exts)]
+
+                if not model_files:
+                    console.print(f"[red]No model files found in {repo_id}[/red]")
+                    conn.close()
+                    return
+
+                if file_pattern:
+                    matches = [f for f in model_files if fnmatch.fnmatch(f, file_pattern)]
+                    if not matches:
+                        console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
+                        conn.close()
+                        return
+                    chosen_file = matches[0]
+                elif len(model_files) == 1:
+                    chosen_file = model_files[0]
+                else:
+                    console.print(f"Multiple model files in [bold]{repo_id}[/bold]:")
+                    for i, f in enumerate(model_files, 1):
+                        console.print(f"  {i}. {f}")
+                    idx = click.prompt("Pick a number", type=click.IntRange(1, len(model_files)))
+                    chosen_file = model_files[idx - 1]
+
+                console.print(f"Downloading [bold]{chosen_file}[/bold] from {repo_id}...")
+            _hf_kwargs = dict(repo_id=repo_id, filename=chosen_file,
+                              local_dir=str(dest_dir), token=token)
+            if revision:
+                _hf_kwargs["revision"] = revision
+            local_path = Path(hf_hub_download(**_hf_kwargs))
 
             size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
             fpath = str(local_path)
@@ -1526,6 +1614,74 @@ def pull(ref, backend, file_pattern, subdir):
             )
 
     conn.close()
+
+
+# ─── rename ───────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("model")
+@click.argument("new_name")
+def rename(model, new_name):
+    """Rename a model file and registry entry, keeping all metadata intact.
+
+    NEW_NAME should be given without the file extension — the extension is
+    preserved automatically.  display_name and file_path are updated; all
+    other fields (source_url, ratings, notes, events, etc.) are unchanged.
+    """
+    config = load_config()
+    conn = get_db(config)
+    row = find_model(conn, model)
+    now = now_iso()
+
+    old_display = row["display_name"]
+
+    if row["backend"] in ("llamacpp", "comfyui"):
+        if not row["file_path"]:
+            console.print("[red]No file_path recorded for this model — cannot rename on disk.[/red]")
+            conn.close()
+            return
+        old_path = Path(row["file_path"])
+        if not old_path.exists():
+            console.print(f"[yellow]File not found on disk: {old_path}[/yellow]")
+            if not click.confirm("Update registry name anyway?", default=False):
+                conn.close()
+                return
+            new_path = old_path.with_stem(new_name)
+        else:
+            new_path = old_path.with_stem(new_name)
+            if new_path.exists():
+                console.print(f"[red]A file already exists at {new_path} — aborting.[/red]")
+                conn.close()
+                return
+            old_path.rename(new_path)
+            console.print(f"[green]✓ Renamed file: {old_path.name} → {new_path.name}[/green]")
+
+        conn.execute(
+            "UPDATE models SET display_name=?, file_path=?, last_updated=? WHERE id=?",
+            (new_name, str(new_path), now, row["id"]),
+        )
+
+    elif row["backend"] == "ollama":
+        # Ollama models are identified by ollama_name, not a file path.
+        # Only the registry display_name changes.
+        conn.execute(
+            "UPDATE models SET display_name=?, last_updated=? WHERE id=?",
+            (new_name, now, row["id"]),
+        )
+
+    else:
+        conn.execute(
+            "UPDATE models SET display_name=?, last_updated=? WHERE id=?",
+            (new_name, now, row["id"]),
+        )
+
+    conn.execute(
+        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+        (row["id"], "rename", now, f"{old_display} → {new_name}"),
+    )
+    conn.commit()
+    conn.close()
+    console.print(f"[green]✓ Registry updated: '{old_display}' → '{new_name}'[/green]")
 
 
 # ─── delete ───────────────────────────────────────────────────────────────────
@@ -1773,6 +1929,71 @@ def enrich():
 
             progress.advance(task)
             time.sleep(0.5)
+
+    conn.commit()
+
+    # ── CivitAI enrichment phase ─────────────────────────────────────────────
+    civitai_rows = conn.execute(
+        "SELECT id, display_name, source_url, source_type FROM models"
+        " WHERE source_type='comfyui_civitai' AND source_url IS NOT NULL"
+    ).fetchall()
+
+    if civitai_rows:
+        civitai_cfg = config.get("civitai", {})
+        civitai_token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
+        civitai_token = os.environ.get(civitai_token_env)
+
+        console.print(f"\nEnriching [bold]{len(civitai_rows)}[/bold] CivitAI model(s)...")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("CivitAI...", total=len(civitai_rows))
+
+            for row in civitai_rows:
+                progress.update(task, description=row["display_name"][:45])
+                version_id = parse_civitai_version_id(row["source_url"])
+                if not version_id:
+                    progress.advance(task)
+                    continue
+
+                url = f"https://civitai.com/api/v1/model-versions/{version_id}"
+                params = {"token": civitai_token} if civitai_token else {}
+                try:
+                    resp = requests.get(url, params=params, timeout=15)
+                    if resp.status_code != 200:
+                        progress.advance(task)
+                        time.sleep(0.5)
+                        continue
+                    data = resp.json()
+                except Exception:
+                    progress.advance(task)
+                    time.sleep(0.5)
+                    continue
+
+                base_model = data.get("baseModel")
+                trained_words = data.get("trainedWords") or []
+                trigger_words_json = json.dumps(trained_words) if trained_words else None
+
+                conn.execute(
+                    """UPDATE models SET
+                       base_model    = COALESCE(?, base_model),
+                       trigger_words = COALESCE(?, trigger_words),
+                       last_updated  = ?
+                       WHERE id=?""",
+                    (base_model, trigger_words_json, now, row["id"]),
+                )
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (row["id"], "enrich", now,
+                     json.dumps({"base_model": base_model, "trigger_words": trained_words})),
+                )
+                progress.advance(task)
+                time.sleep(0.5)
 
     conn.commit()
     conn.close()
