@@ -28,7 +28,7 @@ python mr.py init
 python mr.py <command>
 ```
 
-All commands: `init`, `scan`, `list`, `show`, `rate`, `status`, `note`, `touch`, `report`, `pull`, `delete`, `blacklist`, `enrich`, `search`.
+All commands: `init`, `scan`, `list`, `show`, `rate`, `status`, `note`, `touch`, `report`, `pull`, `rename`, `delete`, `blacklist`, `enrich`, `search`.
 
 ## Architecture
 
