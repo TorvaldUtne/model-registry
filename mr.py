@@ -200,6 +200,14 @@ def get_source_type(ollama_name):
     return "ollama_direct"
 
 
+def get_gguf_backend_names(config):
+    """Return all file-based GGUF backend names (everything except 'ollama' and 'comfyui')."""
+    return [
+        name for name in config.get("backends", {})
+        if name not in ("ollama", "comfyui")
+    ]
+
+
 def run_ollama_list(container):
     result = subprocess.run(
         ["docker", "exec", container, "ollama", "list"],
@@ -705,68 +713,71 @@ def scan():
         except FileNotFoundError:
             console.print("[red]'docker' command not found. Is Docker installed and on PATH?[/red]")
 
-    # ── llama.cpp ────────────────────────────────────────────────────────────
-    llamacpp_cfg = config["backends"].get("llamacpp", {})
-    if llamacpp_cfg.get("enabled", False):
-        model_dir = Path(llamacpp_cfg.get("model_dir", ""))
-        extensions = llamacpp_cfg.get("extensions", [".gguf"])
-        console.print(f"\nScanning llama.cpp models in [bold]{model_dir}[/bold]...")
+    # ── GGUF file backends (llamacpp, llamaserver, etc.) ─────────────────────
+    for bname in get_gguf_backend_names(config):
+        bcfg = config["backends"][bname]
+        if not bcfg.get("enabled", False):
+            continue
+        model_dir = Path(bcfg.get("model_dir", ""))
+        extensions = bcfg.get("extensions", [".gguf"])
+        console.print(f"\nScanning {bname} models in [bold]{model_dir}[/bold]...")
         if not model_dir.exists():
-            console.print(f"[red]llama.cpp model_dir does not exist: {model_dir}[/red]")
-        else:
-            files = []
-            for ext in extensions:
-                files.extend(model_dir.glob(f"*{ext}"))
-            console.print(f"  Found {len(files)} GGUF file(s).")
+            console.print(f"[red]{bname} model_dir does not exist: {model_dir}[/red]")
+            continue
 
-            seen_paths = set()
-            for f in sorted(files):
-                fpath = str(f)
-                seen_paths.add(fpath)
-                size_gb = round(f.stat().st_size / (1024 ** 3), 4)
-                variant = parse_variant_from_filename(f.name)
+        files = []
+        for ext in extensions:
+            files.extend(model_dir.glob(f"*{ext}"))
+        console.print(f"  Found {len(files)} file(s).")
 
-                existing = conn.execute(
-                    "SELECT * FROM models WHERE file_path=?", (fpath,)
-                ).fetchone()
+        seen_paths = set()
+        for f in sorted(files):
+            fpath = str(f)
+            seen_paths.add(fpath)
+            size_gb = round(f.stat().st_size / (1024 ** 3), 4)
+            variant = parse_variant_from_filename(f.name)
 
-                if existing:
-                    conn.execute(
-                        "UPDATE models SET size_gb=?, currently_local=1, last_updated=? WHERE id=?",
-                        (size_gb, now, existing["id"]),
-                    )
-                    conn.execute(
-                        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                        (existing["id"], "scan_updated", now, json.dumps({"size_gb": size_gb})),
-                    )
-                    updated += 1
-                else:
-                    display_name = f.stem  # filename without .gguf extension
-                    conn.execute(
-                        """INSERT INTO models
-                           (display_name, variant, backend, source_type,
-                            file_path, size_gb, currently_local, first_seen, last_updated)
-                           VALUES (?,?,?,?,?,?,1,?,?)""",
-                        (display_name, variant, "llamacpp", "llamacpp", fpath, size_gb, now, now),
-                    )
-                    mid = _last_id(conn)
-                    conn.execute(
-                        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                        (mid, "scan_added", now, json.dumps({"file_path": fpath})),
-                    )
-                    added += 1
+            existing = conn.execute(
+                "SELECT * FROM models WHERE file_path=?", (fpath,)
+            ).fetchone()
 
-            # Mark disappeared files as not-local
-            db_llamacpp = conn.execute(
-                "SELECT id, file_path FROM models WHERE backend='llamacpp' AND currently_local=1"
-            ).fetchall()
-            for row in db_llamacpp:
-                if row["file_path"] not in seen_paths:
-                    conn.execute(
-                        "UPDATE models SET currently_local=0, last_updated=? WHERE id=?",
-                        (now, row["id"]),
-                    )
-                    console.print(f"  [yellow]Marked not-local: {row['file_path']}[/yellow]")
+            if existing:
+                conn.execute(
+                    "UPDATE models SET size_gb=?, currently_local=1, last_updated=? WHERE id=?",
+                    (size_gb, now, existing["id"]),
+                )
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (existing["id"], "scan_updated", now, json.dumps({"size_gb": size_gb})),
+                )
+                updated += 1
+            else:
+                display_name = f.stem
+                conn.execute(
+                    """INSERT INTO models
+                       (display_name, variant, backend, source_type,
+                        file_path, size_gb, currently_local, first_seen, last_updated)
+                       VALUES (?,?,?,?,?,?,1,?,?)""",
+                    (display_name, variant, bname, bname, fpath, size_gb, now, now),
+                )
+                mid = _last_id(conn)
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (mid, "scan_added", now, json.dumps({"file_path": fpath})),
+                )
+                added += 1
+
+        # Mark disappeared files as not-local
+        db_rows = conn.execute(
+            "SELECT id, file_path FROM models WHERE backend=? AND currently_local=1", (bname,)
+        ).fetchall()
+        for row in db_rows:
+            if row["file_path"] not in seen_paths:
+                conn.execute(
+                    "UPDATE models SET currently_local=0, last_updated=? WHERE id=?",
+                    (now, row["id"]),
+                )
+                console.print(f"  [yellow]Marked not-local: {row['file_path']}[/yellow]")
 
     # ── ComfyUI ──────────────────────────────────────────────────────────────
     comfy_cfg = config["backends"].get("comfyui", {})
@@ -789,7 +800,7 @@ def scan():
 # ─── list ─────────────────────────────────────────────────────────────────────
 
 @cli.command("list")
-@click.option("--backend", type=click.Choice(["ollama", "llamacpp", "comfyui"]), default=None)
+@click.option("--backend", type=str, default=None)
 @click.option(
     "--status",
     type=click.Choice(["active", "unrated", "blacklisted", "deleted", "on_hold", "testing", "keep", "favorite"]),
@@ -1167,10 +1178,16 @@ def report():
             console.print(f"    {r['names']}")
     else:
         console.print("\n[dim]No cross-backend duplicates detected.[/dim]")
-        no_hf = _scalar(conn, "SELECT COUNT(*) FROM models WHERE backend='llamacpp' AND hf_repo IS NULL AND currently_local=1")
+        gguf_backends = get_gguf_backend_names(config)
+        placeholders = ",".join("?" * len(gguf_backends))
+        no_hf = _scalar(
+            conn,
+            f"SELECT COUNT(*) FROM models WHERE backend IN ({placeholders}) AND hf_repo IS NULL AND currently_local=1",
+            tuple(gguf_backends),
+        ) if gguf_backends else 0
         if no_hf:
             console.print(
-                f"[dim]  ({no_hf} llamacpp model(s) have no hf_repo — "
+                f"[dim]  ({no_hf} GGUF model(s) have no hf_repo — "
                 "run 'mr enrich' for accurate duplicate detection)[/dim]"
             )
 
@@ -1181,7 +1198,7 @@ def report():
 
 @cli.command()
 @click.argument("ref")
-@click.option("--backend", type=click.Choice(["ollama", "llamacpp", "comfyui"]), default=None)
+@click.option("--backend", type=str, default=None)
 @click.option("--file", "file_pattern", default=None, help="Glob pattern for file in HF repo")
 @click.option("--subdir", default=None, help="ComfyUI subdir to save into (e.g. checkpoints, loras)")
 def pull(ref, backend, file_pattern, subdir):
@@ -1281,8 +1298,8 @@ def pull(ref, backend, file_pattern, subdir):
         conn.commit()
         console.print("[green]✓ Pull complete. Registry updated.[/green]")
 
-    # ── llama.cpp / HF download ──────────────────────────────────────────────
-    elif backend == "llamacpp":
+    # ── GGUF file backends (llamacpp, llamaserver, etc.) ────────────────────
+    elif backend in get_gguf_backend_names(config):
         try:
             from huggingface_hub import hf_hub_download, list_repo_files
         except ImportError:
@@ -1290,7 +1307,7 @@ def pull(ref, backend, file_pattern, subdir):
             conn.close()
             return
 
-        model_dir = Path(config["backends"]["llamacpp"]["model_dir"])
+        model_dir = Path(config["backends"][backend]["model_dir"])
         token_env = config["huggingface"]["token_env_var"]
         token = os.environ.get(token_env)
 
@@ -1300,7 +1317,7 @@ def pull(ref, backend, file_pattern, subdir):
             file_pattern = f"*{parsed_variant}*.gguf"
 
         if "/" not in repo_id:
-            console.print("[red]For llamacpp, ref must be 'org/repo' or 'hf.co/org/repo:tag' format.[/red]")
+            console.print(f"[red]For {backend}, ref must be 'org/repo' or 'hf.co/org/repo:tag' format.[/red]")
             conn.close()
             return
 
@@ -1357,7 +1374,7 @@ def pull(ref, backend, file_pattern, subdir):
                     file_path, size_gb, currently_local, times_downloaded,
                     first_seen, last_used, last_updated)
                    VALUES (?,?,?,?,?,?,?,1,1,?,?,?)""",
-                (local_path.stem, repo_id, variant, "llamacpp", "llamacpp",
+                (local_path.stem, repo_id, variant, backend, backend,
                  str(local_path), size_gb, now, now, now),
             )
             mid = _last_id(conn)
@@ -1616,6 +1633,104 @@ def pull(ref, backend, file_pattern, subdir):
     conn.close()
 
 
+# ─── restore ──────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Show what would be downloaded without downloading")
+@click.pass_context
+def restore(ctx, dry_run):
+    """Re-download all missing ComfyUI models that have a known source.
+
+    Models with source_type 'comfyui_civitai' are re-pulled via their stored
+    source_url. Models with source_type 'comfyui_hf' are re-pulled via their
+    hf_repo, using the stored file_path basename to select the right file.
+    """
+    config = load_config()
+    conn = get_db(config)
+    init_db(conn)
+
+    restorable = conn.execute(
+        """SELECT * FROM models
+           WHERE backend='comfyui' AND currently_local=0
+             AND (source_url IS NOT NULL OR hf_repo IS NOT NULL)
+           ORDER BY display_name"""
+    ).fetchall()
+
+    no_source = conn.execute(
+        """SELECT display_name FROM models
+           WHERE backend='comfyui' AND currently_local=0
+             AND source_url IS NULL AND hf_repo IS NULL
+           ORDER BY display_name"""
+    ).fetchall()
+
+    conn.close()
+
+    if not restorable and not no_source:
+        console.print("[green]No missing ComfyUI models found.[/green]")
+        return
+
+    if no_source:
+        console.print(
+            f"[yellow]WARNING: {len(no_source)} model(s) have no recorded source and cannot be restored:[/yellow]"
+        )
+        for row in no_source:
+            console.print(f"  [dim]- {row['display_name']}[/dim]")
+
+    if not restorable:
+        return
+
+    console.print(f"\n[bold]{len(restorable)} model(s) queued for restore:[/bold]")
+    for row in restorable:
+        src = row["source_url"] or row["hf_repo"]
+        subdir_label = f"[dim] -> {row['variant']}[/dim]" if row["variant"] else ""
+        console.print(f"  - {row['display_name']}{subdir_label}  [dim]({src})[/dim]")
+
+    if dry_run:
+        return
+
+    if not click.confirm(f"\nDownload {len(restorable)} model(s)?", default=True):
+        return
+
+    failed = []
+    for row in restorable:
+        console.rule(f"[bold]{row['display_name']}[/bold]")
+
+        subdir = row["variant"] or None
+
+        if row["source_url"]:
+            ref = row["source_url"]
+            file_pattern = None
+        else:
+            ref = row["hf_repo"]
+            file_pattern = Path(row["file_path"]).name if row["file_path"] else None
+
+        if not subdir and row["file_path"]:
+            # Derive subdir from the stored file path relative to base_dir
+            comfy_cfg = config["backends"].get("comfyui", {})
+            base_dir = Path(comfy_cfg.get("base_dir", ""))
+            try:
+                rel = Path(row["file_path"]).relative_to(base_dir)
+                subdir = rel.parts[0] if len(rel.parts) > 1 else None
+            except ValueError:
+                pass
+
+        try:
+            ctx.invoke(pull, ref=ref, backend="comfyui", file_pattern=file_pattern, subdir=subdir)
+        except SystemExit:
+            failed.append(row["display_name"])
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+            failed.append(row["display_name"])
+
+    console.rule()
+    if failed:
+        console.print(f"[red]Failed to restore {len(failed)} model(s):[/red]")
+        for name in failed:
+            console.print(f"  - {name}")
+    else:
+        console.print(f"[green]All {len(restorable)} model(s) restored.[/green]")
+
+
 # ─── rename ───────────────────────────────────────────────────────────────────
 
 @cli.command()
@@ -1635,7 +1750,7 @@ def rename(model, new_name):
 
     old_display = row["display_name"]
 
-    if row["backend"] in ("llamacpp", "comfyui"):
+    if row["backend"] != "ollama":
         if not row["file_path"]:
             console.print("[red]No file_path recorded for this model — cannot rename on disk.[/red]")
             conn.close()
@@ -1659,14 +1774,6 @@ def rename(model, new_name):
         conn.execute(
             "UPDATE models SET display_name=?, file_path=?, last_updated=? WHERE id=?",
             (new_name, str(new_path), now, row["id"]),
-        )
-
-    elif row["backend"] == "ollama":
-        # Ollama models are identified by ollama_name, not a file path.
-        # Only the registry display_name changes.
-        conn.execute(
-            "UPDATE models SET display_name=?, last_updated=? WHERE id=?",
-            (new_name, now, row["id"]),
         )
 
     else:
@@ -1711,7 +1818,7 @@ def delete(model):
             return
         console.print("[green]✓ Removed from Ollama.[/green]")
 
-    elif row["backend"] in ("llamacpp", "comfyui"):
+    elif row["backend"] != "ollama":
         if row["file_path"]:
             p = Path(row["file_path"])
             if p.exists():
@@ -1764,8 +1871,9 @@ def blacklist(model, reason):
             conn.close()
             return
         hf_repo, variant = parse_hf_repo_from_ollama(model)
+        _bl_backends = ["ollama"] + get_gguf_backend_names(config) + ["comfyui"]
         backend = click.prompt(
-            "Backend", type=click.Choice(["ollama", "llamacpp", "comfyui"]), default="ollama"
+            "Backend", type=click.Choice(_bl_backends), default="ollama"
         )
         conn.execute(
             """INSERT INTO models
@@ -1811,7 +1919,7 @@ def blacklist(model, reason):
                 console.print("[green]✓ Removed from Ollama.[/green]")
             else:
                 console.print(f"[yellow]⚠ Ollama delete failed: {result.stderr.strip()}[/yellow]")
-        elif row["backend"] in ("llamacpp", "comfyui") and row["file_path"]:
+        elif row["backend"] != "ollama" and row["file_path"]:
             p = Path(row["file_path"])
             if p.exists():
                 p.unlink()
