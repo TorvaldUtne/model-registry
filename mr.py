@@ -725,13 +725,67 @@ def scan():
             console.print(f"[red]{bname} model_dir does not exist: {model_dir}[/red]")
             continue
 
-        files = []
+        # Scan subdirectories first (each subdir = one model with multiple GGUF files)
+        # Then scan top-level .gguf files
+        subdirs = [d for d in model_dir.iterdir() if d.is_dir()]
+        top_level_files = []
         for ext in extensions:
-            files.extend(model_dir.glob(f"*{ext}"))
-        console.print(f"  Found {len(files)} file(s).")
+            top_level_files.extend(model_dir.glob(f"*{ext}"))
+        # Filter out files that are inside subdirs
+        top_level_files = [f for f in top_level_files if f.parent == model_dir]
 
+        total_files = 0
         seen_paths = set()
-        for f in sorted(files):
+
+        # Process subdirectories (models with multiple GGUF files)
+        for subdir in sorted(subdirs):
+            subdir_gguf_files = []
+            for ext in extensions:
+                subdir_gguf_files.extend(subdir.glob(f"*{ext}"))
+
+            if not subdir_gguf_files:
+                continue
+
+            total_files += len(subdir_gguf_files)
+            variant = subdir.name
+            # Use the largest file in the subdir for size and name
+            main_file = max(subdir_gguf_files, key=lambda f: f.stat().st_size)
+            fpath = str(main_file)
+            seen_paths.add(fpath)
+            size_gb = round(sum(f.stat().st_size for f in subdir_gguf_files) / (1024 ** 3), 4)
+
+            # Use subdir name as display_name, variant is subdir name too
+            existing = conn.execute(
+                "SELECT * FROM models WHERE file_path=?", (fpath,)
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    "UPDATE models SET size_gb=?, currently_local=1, last_updated=?, variant=? WHERE id=?",
+                    (size_gb, now, variant, existing["id"]),
+                )
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (existing["id"], "scan_updated", now, json.dumps({"size_gb": size_gb, "variant": variant})),
+                )
+                updated += 1
+            else:
+                conn.execute(
+                    """INSERT INTO models
+                       (display_name, variant, backend, source_type,
+                        file_path, size_gb, currently_local, first_seen, last_updated)
+                       VALUES (?,?,?,?,?,?,1,?,?)""",
+                    (subdir.name, variant, bname, bname, fpath, size_gb, now, now),
+                )
+                mid = _last_id(conn)
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (mid, "scan_added", now, json.dumps({"file_path": fpath, "subdir": subdir.name})),
+                )
+                added += 1
+
+        # Process top-level .gguf files (single-file models)
+        for f in sorted(top_level_files):
             fpath = str(f)
             seen_paths.add(fpath)
             size_gb = round(f.stat().st_size / (1024 ** 3), 4)
@@ -767,7 +821,9 @@ def scan():
                 )
                 added += 1
 
-        # Mark disappeared files as not-local
+        console.print(f"  Found {total_files + len(top_level_files)} GGUF file(s) in {len(subdirs) + len(top_level_files)} model(s).")
+
+        # Mark disappeared files/subdirs as not-local
         db_rows = conn.execute(
             "SELECT id, file_path FROM models WHERE backend=? AND currently_local=1", (bname,)
         ).fetchall()
@@ -1206,6 +1262,10 @@ def pull(ref, backend, file_pattern, subdir):
 
     For ComfyUI models, --subdir is required. Supports HuggingFace repos
     (org/repo format) and CivitAI downloads (civitai:<versionId> or CivitAI URL).
+
+    For GGUF (llama.cpp) models, when multiple .gguf files exist, all files will
+    be downloaded to a subdirectory named after the repo. Use --file with a glob
+    pattern to download specific files instead.
     """
     config = load_config()
     conn = get_db(config)
@@ -1335,57 +1395,95 @@ def pull(ref, backend, file_pattern, subdir):
                 console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
                 conn.close()
                 return
-            chosen_file = matches[0]
+            files_to_download = matches
         elif len(gguf_files) == 1:
-            chosen_file = gguf_files[0]
+            files_to_download = gguf_files
         else:
             console.print(f"Multiple GGUF files in [bold]{repo_id}[/bold]:")
             for i, f in enumerate(gguf_files, 1):
                 console.print(f"  {i}. {f}")
-            idx = click.prompt("Pick a number", type=click.IntRange(1, len(gguf_files)))
-            chosen_file = gguf_files[idx - 1]
+            # For multiple files, ask if user wants all or specific pattern
+            if click.confirm("Download all GGUF files to a subdirectory?", default=True):
+                files_to_download = gguf_files
+            else:
+                file_pattern = click.prompt("Enter pattern (e.g., *Q4_K_M*)")
+                matches = [f for f in gguf_files if fnmatch.fnmatch(f, file_pattern)]
+                if not matches:
+                    console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
+                    conn.close()
+                    return
+                files_to_download = matches
 
-        console.print(f"Downloading [bold]{chosen_file}[/bold] from {repo_id}...")
-        local_path = Path(
-            hf_hub_download(
-                repo_id=repo_id,
-                filename=chosen_file,
-                local_dir=str(model_dir),
-                token=token,
+        # Create subdirectory for this model based on repo name
+        repo_name = repo_id.split("/")[1] if "/" in repo_id else repo_id
+        # Clean up repo name for use as directory name
+        repo_name = re.sub(r'[^a-zA-Z0-9_.-]', '-', repo_name)
+        target_dir = model_dir / repo_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        console.print(f"Downloading {len(files_to_download)} file(s) to [bold]{target_dir}[/bold]...")
+        downloaded_paths = []
+        for gguf_file in files_to_download:
+            local_path = Path(
+                hf_hub_download(
+                    repo_id=repo_id,
+                    filename=gguf_file,
+                    local_dir=str(target_dir),
+                    local_dir_use_symlinks=False,  # Ensure actual files are copied
+                    token=token,
+                )
             )
-        )
+            downloaded_paths.append(str(local_path))
+            console.print(f"  Downloaded: {gguf_file}")
 
-        size_gb = round(local_path.stat().st_size / (1024 ** 3), 2)
-        variant = parse_variant_from_filename(local_path.name)
+        # Calculate total size of all downloaded files
+        total_size = sum(Path(p).stat().st_size for p in downloaded_paths)
+        size_gb = round(total_size / (1024 ** 3), 2)
 
-        if existing:
+        # Use the largest file for main path and name
+        main_file = max(downloaded_paths, key=lambda p: Path(p).stat().st_size)
+        main_path = Path(main_file)
+        variant = parse_variant_from_filename(main_path.name)
+
+        # Check if this subdirectory model already exists (by any file in it)
+        existing_by_dir = None
+        for p in downloaded_paths:
+            existing_by_dir = conn.execute(
+                "SELECT * FROM models WHERE file_path=?", (p,)
+            ).fetchone()
+            if existing_by_dir:
+                break
+
+        if existing_by_dir:
+            # Update existing model entry
             conn.execute(
                 """UPDATE models
                    SET currently_local=1, times_downloaded=times_downloaded+1,
-                       file_path=?, size_gb=?, last_used=?, last_updated=?
+                       file_path=?, size_gb=?, last_used=?, last_updated=?, variant=?
                    WHERE id=?""",
-                (str(local_path), size_gb, now, now, existing["id"]),
+                (main_file, size_gb, now, now, variant, existing_by_dir["id"]),
             )
-            mid = existing["id"]
+            mid = existing_by_dir["id"]
         else:
+            # Create new model entry with subdir as display_name
             conn.execute(
                 """INSERT INTO models
                    (display_name, hf_repo, variant, backend, source_type,
                     file_path, size_gb, currently_local, times_downloaded,
                     first_seen, last_used, last_updated)
                    VALUES (?,?,?,?,?,?,?,1,1,?,?,?)""",
-                (local_path.stem, repo_id, variant, backend, backend,
-                 str(local_path), size_gb, now, now, now),
+                (repo_name, repo_id, variant, backend, backend,
+                 main_file, size_gb, now, now, now),
             )
             mid = _last_id(conn)
 
         conn.execute(
             "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (mid, "pull", now, json.dumps({"repo_id": repo_id, "file": chosen_file})),
+            (mid, "pull", now, json.dumps({"repo_id": repo_id, "files": files_to_download, "subdir": repo_name})),
         )
         conn.commit()
         console.print(
-            f"[green]✓ Downloaded to {local_path} ({size_gb:.2f} GB). Registry updated.[/green]"
+            f"[green]✓ Downloaded {len(files_to_download)} file(s) to {target_dir} ({size_gb:.2f} GB). Registry updated.[/green]"
         )
 
     # ── ComfyUI download (HuggingFace or CivitAI) ────────────────────────────
