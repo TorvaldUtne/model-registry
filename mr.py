@@ -142,7 +142,7 @@ def find_model(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
         console.print(f"[red]No model matching '{name}' found.[/red]")
         all_names = [r["display_name"] for r in conn.execute("SELECT display_name FROM models").fetchall()]
         name_lower = name.lower()
-        suggestions = [n for n in all_names if any(c in n.lower() for c in name_lower)][:5]
+        suggestions = [n for n in all_names if name_lower in n.lower()][:5]
         if suggestions:
             console.print("Did you mean:")
             for s in suggestions:
@@ -345,7 +345,7 @@ def fetch_civitai_model_info(model_id, token=None, host="civitai.com"):
         if resp.status_code != 200:
             return None, None
         data = resp.json()
-    except Exception:
+    except (_requests.RequestException, json.JSONDecodeError):
         return None, None
     # Default/latest version is first in the list
     versions = data.get("modelVersions", [])
@@ -919,7 +919,7 @@ def list_models(backend, status, unrated, show_all):
             try:
                 dt = datetime.fromisoformat(last_used.replace("Z", "+00:00"))
                 last_used = dt.strftime(date_fmt)
-            except Exception:
+            except ValueError:
                 pass
 
         not_local = "" if row["currently_local"] else " [dim](not local)[/dim]"
@@ -954,7 +954,7 @@ def show(model):
     if row["tags"]:
         try:
             tags = json.loads(row["tags"])
-        except Exception:
+        except json.JSONDecodeError:
             tags = [row["tags"]]
 
     lines = []
@@ -1011,7 +1011,7 @@ def show(model):
         if row["trigger_words"]:
             try:
                 words = json.loads(row["trigger_words"])
-            except Exception:
+            except json.JSONDecodeError:
                 words = [row["trigger_words"]]
             lines.append(f"[bold]Triggers:[/bold]   {', '.join(words)}")
 
@@ -1429,7 +1429,6 @@ def pull(ref, backend, file_pattern, subdir):
                     repo_id=repo_id,
                     filename=gguf_file,
                     local_dir=str(target_dir),
-                    local_dir_use_symlinks=False,  # Ensure actual files are copied
                     token=token,
                 )
             )
@@ -1570,18 +1569,22 @@ def pull(ref, backend, file_pattern, subdir):
             local_path = dest_dir / filename
             total = int(resp.headers.get("Content-Length", 0)) or None
 
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task(f"Downloading {filename}", total=total)
-                with open(local_path, "wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        fh.write(chunk)
-                        progress.advance(task, len(chunk))
+            try:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task(f"Downloading {filename}", total=total)
+                    with open(local_path, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            fh.write(chunk)
+                            progress.advance(task, len(chunk))
+            except Exception:
+                local_path.unlink(missing_ok=True)
+                raise
 
             size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
             fpath = str(local_path)
@@ -1845,48 +1848,46 @@ def rename(model, new_name):
     conn = get_db(config)
     row = find_model(conn, model)
     now = now_iso()
+    try:
+        old_display = row["display_name"]
 
-    old_display = row["display_name"]
-
-    if row["backend"] != "ollama":
-        if not row["file_path"]:
-            console.print("[red]No file_path recorded for this model — cannot rename on disk.[/red]")
-            conn.close()
-            return
-        old_path = Path(row["file_path"])
-        if not old_path.exists():
-            console.print(f"[yellow]File not found on disk: {old_path}[/yellow]")
-            if not click.confirm("Update registry name anyway?", default=False):
-                conn.close()
+        if row["backend"] != "ollama":
+            if not row["file_path"]:
+                console.print("[red]No file_path recorded for this model — cannot rename on disk.[/red]")
                 return
-            new_path = old_path.with_stem(new_name)
+            old_path = Path(row["file_path"])
+            if not old_path.exists():
+                console.print(f"[yellow]File not found on disk: {old_path}[/yellow]")
+                if not click.confirm("Update registry name anyway?", default=False):
+                    return
+                new_path = old_path.with_stem(new_name)
+            else:
+                new_path = old_path.with_stem(new_name)
+                if new_path.exists():
+                    console.print(f"[red]A file already exists at {new_path} — aborting.[/red]")
+                    return
+                old_path.rename(new_path)
+                console.print(f"[green]✓ Renamed file: {old_path.name} → {new_path.name}[/green]")
+
+            conn.execute(
+                "UPDATE models SET display_name=?, file_path=?, last_updated=? WHERE id=?",
+                (new_name, str(new_path), now, row["id"]),
+            )
+
         else:
-            new_path = old_path.with_stem(new_name)
-            if new_path.exists():
-                console.print(f"[red]A file already exists at {new_path} — aborting.[/red]")
-                conn.close()
-                return
-            old_path.rename(new_path)
-            console.print(f"[green]✓ Renamed file: {old_path.name} → {new_path.name}[/green]")
+            conn.execute(
+                "UPDATE models SET display_name=?, last_updated=? WHERE id=?",
+                (new_name, now, row["id"]),
+            )
 
         conn.execute(
-            "UPDATE models SET display_name=?, file_path=?, last_updated=? WHERE id=?",
-            (new_name, str(new_path), now, row["id"]),
+            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+            (row["id"], "rename", now, f"{old_display} → {new_name}"),
         )
-
-    else:
-        conn.execute(
-            "UPDATE models SET display_name=?, last_updated=? WHERE id=?",
-            (new_name, now, row["id"]),
-        )
-
-    conn.execute(
-        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-        (row["id"], "rename", now, f"{old_display} → {new_name}"),
-    )
-    conn.commit()
-    conn.close()
-    console.print(f"[green]✓ Registry updated: '{old_display}' → '{new_name}'[/green]")
+        conn.commit()
+        console.print(f"[green]✓ Registry updated: '{old_display}' → '{new_name}'[/green]")
+    finally:
+        conn.close()
 
 
 # ─── delete ───────────────────────────────────────────────────────────────────
@@ -1899,43 +1900,42 @@ def delete(model):
     conn = get_db(config)
     row = find_model(conn, model)
     now = now_iso()
-
-    if not click.confirm(f"Delete '{row['display_name']}'?", default=False):
-        conn.close()
-        return
-
-    if row["backend"] == "ollama":
-        container = config["backends"]["ollama"]["docker_container"]
-        result = subprocess.run(
-            ["docker", "exec", container, "ollama", "rm", row["ollama_name"]],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            console.print(f"[red]Delete failed: {result.stderr.strip()}[/red]")
-            conn.close()
+    try:
+        if not click.confirm(f"Delete '{row['display_name']}'?", default=False):
             return
-        console.print("[green]✓ Removed from Ollama.[/green]")
 
-    elif row["backend"] != "ollama":
-        if row["file_path"]:
-            p = Path(row["file_path"])
-            if p.exists():
-                p.unlink()
-                console.print(f"[green]✓ Deleted file: {p}[/green]")
-            else:
-                console.print(f"[yellow]File not found (already gone?): {p}[/yellow]")
+        if row["backend"] == "ollama":
+            container = config["backends"]["ollama"]["docker_container"]
+            result = subprocess.run(
+                ["docker", "exec", container, "ollama", "rm", row["ollama_name"]],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                console.print(f"[red]Delete failed: {result.stderr.strip()}[/red]")
+                return
+            console.print("[green]✓ Removed from Ollama.[/green]")
 
-    conn.execute(
-        "UPDATE models SET currently_local=0, status='deleted', last_updated=? WHERE id=?",
-        (now, row["id"]),
-    )
-    conn.execute(
-        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-        (row["id"], "delete", now, None),
-    )
-    conn.commit()
-    conn.close()
-    console.print("[green]✓ Registry updated (status=deleted).[/green]")
+        elif row["backend"] != "ollama":
+            if row["file_path"]:
+                p = Path(row["file_path"])
+                if p.exists():
+                    p.unlink()
+                    console.print(f"[green]✓ Deleted file: {p}[/green]")
+                else:
+                    console.print(f"[yellow]File not found (already gone?): {p}[/yellow]")
+
+        conn.execute(
+            "UPDATE models SET currently_local=0, status='deleted', last_updated=? WHERE id=?",
+            (now, row["id"]),
+        )
+        conn.execute(
+            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+            (row["id"], "delete", now, None),
+        )
+        conn.commit()
+        console.print("[green]✓ Registry updated (status=deleted).[/green]")
+    finally:
+        conn.close()
 
 
 # ─── blacklist ────────────────────────────────────────────────────────────────
@@ -1963,76 +1963,77 @@ def blacklist(model, reason):
         (f"%{model}%", f"%{model}%"),
     ).fetchall()
 
-    if not rows:
-        console.print(f"[yellow]'{model}' not found in registry.[/yellow]")
-        if not click.confirm("Add it as a new blacklisted entry?", default=True):
-            conn.close()
-            return
-        hf_repo, variant = parse_hf_repo_from_ollama(model)
-        _bl_backends = ["ollama"] + get_gguf_backend_names(config) + ["comfyui"]
-        backend = click.prompt(
-            "Backend", type=click.Choice(_bl_backends), default="ollama"
-        )
-        conn.execute(
-            """INSERT INTO models
-               (display_name, hf_repo, variant, backend, source_type,
-                ollama_name, currently_local, first_seen, last_updated)
-               VALUES (?,?,?,?,?,?,0,?,?)""",
-            (model, hf_repo, variant, backend, get_source_type(model),
-             model if backend == "ollama" else None, now, now),
-        )
-        mid = _last_id(conn)
-        row = conn.execute("SELECT * FROM models WHERE id=?", (mid,)).fetchone()
-    elif len(rows) == 1:
-        row = rows[0]
-    else:
-        console.print(f"[yellow]Multiple models match '{model}':[/yellow]")
-        for i, r in enumerate(rows, 1):
-            console.print(f"  {i}. {r['display_name']}  [{r['backend']}]")
-        choice = click.prompt("Pick a number", type=click.IntRange(1, len(rows)))
-        row = rows[choice - 1]
-
-    reason_text = " ".join(reason) if reason else click.prompt("Reason for blacklisting")
-    notes = row["notes"] or ""
-    notes += f"\n[{now}] BLACKLISTED: {reason_text}"
-
-    conn.execute(
-        "UPDATE models SET status='blacklisted', notes=?, last_updated=? WHERE id=?",
-        (notes, now, row["id"]),
-    )
-    conn.execute(
-        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-        (row["id"], "blacklist", now, reason_text),
-    )
-
-    # Auto-delete if currently local
-    if row["currently_local"]:
-        if row["backend"] == "ollama" and row["ollama_name"]:
-            container = config["backends"]["ollama"]["docker_container"]
-            result = subprocess.run(
-                ["docker", "exec", container, "ollama", "rm", row["ollama_name"]],
-                capture_output=True, text=True,
+    try:
+        if not rows:
+            console.print(f"[yellow]'{model}' not found in registry.[/yellow]")
+            if not click.confirm("Add it as a new blacklisted entry?", default=True):
+                return
+            hf_repo, variant = parse_hf_repo_from_ollama(model)
+            _bl_backends = ["ollama"] + get_gguf_backend_names(config) + ["comfyui"]
+            backend = click.prompt(
+                "Backend", type=click.Choice(_bl_backends), default="ollama"
             )
-            if result.returncode == 0:
-                console.print("[green]✓ Removed from Ollama.[/green]")
-            else:
-                console.print(f"[yellow]⚠ Ollama delete failed: {result.stderr.strip()}[/yellow]")
-        elif row["backend"] != "ollama" and row["file_path"]:
-            p = Path(row["file_path"])
-            if p.exists():
-                p.unlink()
-                console.print(f"[green]✓ Deleted file: {p}[/green]")
+            conn.execute(
+                """INSERT INTO models
+                   (display_name, hf_repo, variant, backend, source_type,
+                    ollama_name, currently_local, first_seen, last_updated)
+                   VALUES (?,?,?,?,?,?,0,?,?)""",
+                (model, hf_repo, variant, backend, get_source_type(model),
+                 model if backend == "ollama" else None, now, now),
+            )
+            mid = _last_id(conn)
+            row = conn.execute("SELECT * FROM models WHERE id=?", (mid,)).fetchone()
+        elif len(rows) == 1:
+            row = rows[0]
+        else:
+            console.print(f"[yellow]Multiple models match '{model}':[/yellow]")
+            for i, r in enumerate(rows, 1):
+                console.print(f"  {i}. {r['display_name']}  [{r['backend']}]")
+            choice = click.prompt("Pick a number", type=click.IntRange(1, len(rows)))
+            row = rows[choice - 1]
+
+        reason_text = " ".join(reason) if reason else click.prompt("Reason for blacklisting")
+        notes = row["notes"] or ""
+        notes += f"\n[{now}] BLACKLISTED: {reason_text}"
+
         conn.execute(
-            "UPDATE models SET currently_local=0 WHERE id=?", (row["id"],)
+            "UPDATE models SET status='blacklisted', notes=?, last_updated=? WHERE id=?",
+            (notes, now, row["id"]),
         )
         conn.execute(
             "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "delete", now, "auto-deleted on blacklist"),
+            (row["id"], "blacklist", now, reason_text),
         )
 
-    conn.commit()
-    conn.close()
-    console.print(f"[red]✓ {row['display_name']} blacklisted.[/red]")
+        # Auto-delete if currently local
+        if row["currently_local"]:
+            if row["backend"] == "ollama" and row["ollama_name"]:
+                container = config["backends"]["ollama"]["docker_container"]
+                result = subprocess.run(
+                    ["docker", "exec", container, "ollama", "rm", row["ollama_name"]],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    console.print("[green]✓ Removed from Ollama.[/green]")
+                else:
+                    console.print(f"[yellow]⚠ Ollama delete failed: {result.stderr.strip()}[/yellow]")
+            elif row["backend"] != "ollama" and row["file_path"]:
+                p = Path(row["file_path"])
+                if p.exists():
+                    p.unlink()
+                    console.print(f"[green]✓ Deleted file: {p}[/green]")
+            conn.execute(
+                "UPDATE models SET currently_local=0 WHERE id=?", (row["id"],)
+            )
+            conn.execute(
+                "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                (row["id"], "delete", now, "auto-deleted on blacklist"),
+            )
+
+        conn.commit()
+        console.print(f"[red]✓ {row['display_name']} blacklisted.[/red]")
+    finally:
+        conn.close()
 
 
 # ─── enrich ───────────────────────────────────────────────────────────────────
@@ -2063,93 +2064,27 @@ def enrich():
         conn.close()
         return
 
-    console.print(f"Enriching [bold]{len(rows)}[/bold] model(s) from HuggingFace API...")
+    try:
+        console.print(f"Enriching [bold]{len(rows)}[/bold] model(s) from HuggingFace API...")
 
-    def fetch_hf(repo_id, retries=3):
-        url = f"https://huggingface.co/api/models/{repo_id}"
-        for attempt in range(retries):
-            try:
-                resp = requests.get(url, headers=headers, timeout=15)
-                if resp.status_code == 200:
-                    return resp.json()
-                if resp.status_code == 429:
-                    wait = 2 ** (attempt + 1)
-                    console.print(f"[yellow]Rate limited — waiting {wait}s...[/yellow]")
-                    time.sleep(wait)
-                    continue
-                if resp.status_code == 404:
+        def fetch_hf(repo_id, retries=3):
+            url = f"https://huggingface.co/api/models/{repo_id}"
+            for attempt in range(retries):
+                try:
+                    resp = requests.get(url, headers=headers, timeout=15)
+                    if resp.status_code == 200:
+                        return resp.json()
+                    if resp.status_code == 429:
+                        wait = 2 ** (attempt + 1)
+                        console.print(f"[yellow]Rate limited — waiting {wait}s...[/yellow]")
+                        time.sleep(wait)
+                        continue
+                    if resp.status_code == 404:
+                        return None
                     return None
-                return None
-            except requests.RequestException:
-                time.sleep(1)
-        return None
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Enriching...", total=len(rows))
-
-        for row in rows:
-            progress.update(task, description=row["display_name"][:45])
-            data = fetch_hf(row["hf_repo"])
-
-            if data:
-                # Attempt to extract param count from tags
-                param_count = None
-                for tag in data.get("tags", []):
-                    m = re.match(r"^(\d+(?:\.\d+)?[BbMmKk])$", tag)
-                    if m:
-                        param_count = m.group(1).upper()
-                        break
-
-                # Architecture from model config
-                architecture = None
-                cfg = data.get("config")
-                if isinstance(cfg, dict):
-                    architecture = cfg.get("model_type")
-
-                hf_downloads = data.get("downloads")
-                hf_likes = data.get("likes")
-                hf_last_modified = data.get("lastModified")
-
-                conn.execute(
-                    """UPDATE models SET
-                       param_count      = COALESCE(?, param_count),
-                       architecture     = COALESCE(?, architecture),
-                       hf_downloads     = ?,
-                       hf_likes         = ?,
-                       hf_last_modified = ?,
-                       last_updated     = ?
-                       WHERE id=?""",
-                    (param_count, architecture, hf_downloads,
-                     hf_likes, hf_last_modified, now, row["id"]),
-                )
-                conn.execute(
-                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                    (row["id"], "enrich", now, json.dumps({"hf_downloads": hf_downloads})),
-                )
-
-            progress.advance(task)
-            time.sleep(0.5)
-
-    conn.commit()
-
-    # ── CivitAI enrichment phase ─────────────────────────────────────────────
-    civitai_rows = conn.execute(
-        "SELECT id, display_name, source_url, source_type FROM models"
-        " WHERE source_type='comfyui_civitai' AND source_url IS NOT NULL"
-    ).fetchall()
-
-    if civitai_rows:
-        civitai_cfg = config.get("civitai", {})
-        civitai_token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
-        civitai_token = os.environ.get(civitai_token_env)
-
-        console.print(f"\nEnriching [bold]{len(civitai_rows)}[/bold] CivitAI model(s)...")
+                except requests.RequestException:
+                    time.sleep(1)
+            return None
 
         with Progress(
             SpinnerColumn(),
@@ -2158,52 +2093,120 @@ def enrich():
             TaskProgressColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("CivitAI...", total=len(civitai_rows))
+            task = progress.add_task("Enriching...", total=len(rows))
 
-            for row in civitai_rows:
+            for row in rows:
                 progress.update(task, description=row["display_name"][:45])
-                version_id = parse_civitai_version_id(row["source_url"])
-                if not version_id:
-                    progress.advance(task)
-                    continue
+                data = fetch_hf(row["hf_repo"])
 
-                url = f"https://civitai.com/api/v1/model-versions/{version_id}"
-                params = {"token": civitai_token} if civitai_token else {}
-                try:
-                    resp = requests.get(url, params=params, timeout=15)
-                    if resp.status_code != 200:
-                        progress.advance(task)
-                        time.sleep(0.5)
-                        continue
-                    data = resp.json()
-                except Exception:
-                    progress.advance(task)
-                    time.sleep(0.5)
-                    continue
+                if data:
+                    # Attempt to extract param count from tags
+                    param_count = None
+                    for tag in data.get("tags", []):
+                        m = re.match(r"^(\d+(?:\.\d+)?[BbMmKk])$", tag)
+                        if m:
+                            param_count = m.group(1).upper()
+                            break
 
-                base_model = data.get("baseModel")
-                trained_words = data.get("trainedWords") or []
-                trigger_words_json = json.dumps(trained_words) if trained_words else None
+                    # Architecture from model config
+                    architecture = None
+                    cfg = data.get("config")
+                    if isinstance(cfg, dict):
+                        architecture = cfg.get("model_type")
 
-                conn.execute(
-                    """UPDATE models SET
-                       base_model    = COALESCE(?, base_model),
-                       trigger_words = COALESCE(?, trigger_words),
-                       last_updated  = ?
-                       WHERE id=?""",
-                    (base_model, trigger_words_json, now, row["id"]),
-                )
-                conn.execute(
-                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                    (row["id"], "enrich", now,
-                     json.dumps({"base_model": base_model, "trigger_words": trained_words})),
-                )
+                    hf_downloads = data.get("downloads")
+                    hf_likes = data.get("likes")
+                    hf_last_modified = data.get("lastModified")
+
+                    conn.execute(
+                        """UPDATE models SET
+                           param_count      = COALESCE(?, param_count),
+                           architecture     = COALESCE(?, architecture),
+                           hf_downloads     = ?,
+                           hf_likes         = ?,
+                           hf_last_modified = ?,
+                           last_updated     = ?
+                           WHERE id=?""",
+                        (param_count, architecture, hf_downloads,
+                         hf_likes, hf_last_modified, now, row["id"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                        (row["id"], "enrich", now, json.dumps({"hf_downloads": hf_downloads})),
+                    )
+
                 progress.advance(task)
                 time.sleep(0.5)
 
-    conn.commit()
-    conn.close()
-    console.print("[green]✓ Enrichment complete.[/green]")
+        conn.commit()
+
+        # ── CivitAI enrichment phase ─────────────────────────────────────────────
+        civitai_rows = conn.execute(
+            "SELECT id, display_name, source_url, source_type FROM models"
+            " WHERE source_type='comfyui_civitai' AND source_url IS NOT NULL"
+        ).fetchall()
+
+        if civitai_rows:
+            civitai_cfg = config.get("civitai", {})
+            civitai_token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
+            civitai_token = os.environ.get(civitai_token_env)
+
+            console.print(f"\nEnriching [bold]{len(civitai_rows)}[/bold] CivitAI model(s)...")
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("CivitAI...", total=len(civitai_rows))
+
+                for row in civitai_rows:
+                    progress.update(task, description=row["display_name"][:45])
+                    version_id = parse_civitai_version_id(row["source_url"])
+                    if not version_id:
+                        progress.advance(task)
+                        continue
+
+                    url = f"https://civitai.com/api/v1/model-versions/{version_id}"
+                    params = {"token": civitai_token} if civitai_token else {}
+                    try:
+                        resp = requests.get(url, params=params, timeout=15)
+                        if resp.status_code != 200:
+                            progress.advance(task)
+                            time.sleep(0.5)
+                            continue
+                        data = resp.json()
+                    except (requests.RequestException, json.JSONDecodeError):
+                        progress.advance(task)
+                        time.sleep(0.5)
+                        continue
+
+                    base_model = data.get("baseModel")
+                    trained_words = data.get("trainedWords") or []
+                    trigger_words_json = json.dumps(trained_words) if trained_words else None
+
+                    conn.execute(
+                        """UPDATE models SET
+                           base_model    = COALESCE(?, base_model),
+                           trigger_words = COALESCE(?, trigger_words),
+                           last_updated  = ?
+                           WHERE id=?""",
+                        (base_model, trigger_words_json, now, row["id"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                        (row["id"], "enrich", now,
+                         json.dumps({"base_model": base_model, "trigger_words": trained_words})),
+                    )
+                    progress.advance(task)
+                    time.sleep(0.5)
+
+        conn.commit()
+        console.print("[green]✓ Enrichment complete.[/green]")
+    finally:
+        conn.close()
 
 
 # ─── search ───────────────────────────────────────────────────────────────────
