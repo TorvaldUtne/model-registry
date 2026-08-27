@@ -245,6 +245,17 @@ def parse_variant_from_filename(filename):
     return None
 
 
+def flatten_hf_subdir(directory):
+    """If directory contains exactly one subdirectory, move its contents up and remove the subdir."""
+    subdirs = [d for d in directory.iterdir() if d.is_dir()]
+    if len(subdirs) == 1:
+        subdir = subdirs[0]
+        console.print(f"  [dim]Flattening: {subdir.name}[/dim]")
+        for item in subdir.iterdir():
+            item.rename(directory / item.name)
+        subdir.rmdir()
+
+
 # ─── CivitAI / AIR helpers ───────────────────────────────────────────────────
 
 _CIVITAI_DOMAIN_RE = r"civitai\.(?:com|green|red)"
@@ -1460,6 +1471,10 @@ def pull(ref, backend, file_pattern, subdir):
             downloaded_paths.append(str(local_path))
             console.print(f"  Downloaded: {gguf_file}")
 
+        # Flatten any nested subdirectories created by HuggingFace
+        if target_dir.exists():
+            flatten_hf_subdir(target_dir)
+
         # Calculate total size of all downloaded files
         total_size = sum(Path(p).stat().st_size for p in downloaded_paths)
         size_gb = round(total_size / (1024 ** 3), 2)
@@ -1717,6 +1732,10 @@ def pull(ref, backend, file_pattern, subdir):
             if revision:
                 _hf_kwargs["revision"] = revision
             local_path = Path(hf_hub_download(**_hf_kwargs))
+
+            # Flatten any nested subdirectories created by HuggingFace
+            if dest_dir.exists():
+                flatten_hf_subdir(dest_dir)
 
             size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
             fpath = str(local_path)
@@ -1993,11 +2012,10 @@ def restore(ctx, dry_run):
 @click.argument("model")
 @click.argument("new_name")
 def rename(model, new_name):
-    """Rename a model directory only. Keeps model name and metadata intact.
+    """Rename the directory containing a model, keeping the file name unchanged.
 
-    Only the directory name is changed on disk. The display_name in the registry
-    remains unchanged. Use this when you want to reorganize your file structure
-    without altering the logical model name.
+    Only the parent directory name is changed on disk. The file name and display_name
+    in the registry remain unchanged.
     """
     config = load_config()
     conn = get_db(config)
@@ -2013,19 +2031,21 @@ def rename(model, new_name):
             return
 
         old_path = Path(row["file_path"])
-        if not old_path.exists():
-            console.print(f"[yellow]File not found on disk: {old_path}[/yellow]")
-            if not click.confirm("Update registry file_path anyway?", default=False):
-                return
-            new_path = old_path.with_stem(new_name)
-        else:
-            new_path = old_path.with_stem(new_name)
-            if new_path.exists():
-                console.print(f"[red]A file already exists at {new_path} — aborting.[/red]")
-                return
-            old_path.rename(new_path)
-            console.print(f"[green]✓ Renamed file: {old_path.name} → {new_path.name}[/green]")
+        old_dir = old_path.parent
+        new_dir = old_dir.with_name(new_name)
 
+        if not old_dir.exists():
+            console.print(f"[yellow]Directory not found on disk: {old_dir}[/yellow]")
+            if not click.confirm("Update registry path anyway?", default=False):
+                return
+        else:
+            if new_dir.exists():
+                console.print(f"[red]Directory already exists: {new_dir} — aborting.[/red]")
+                return
+            old_dir.rename(new_dir)
+            console.print(f"[green]✓ Renamed directory: {old_dir.name} → {new_dir.name}[/green]")
+
+        new_path = new_dir / old_path.name
         conn.execute(
             "UPDATE models SET file_path=?, last_updated=? WHERE id=?",
             (str(new_path), now, row["id"]),
@@ -2033,7 +2053,7 @@ def rename(model, new_name):
 
         conn.execute(
             "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "rename_dir", now, f"{old_path.name} → {new_path.name}"),
+            (row["id"], "rename", now, f"{old_dir.name} → {new_dir.name}"),
         )
         conn.commit()
         console.print(f"[green]✓ File path updated in registry[/green]")
