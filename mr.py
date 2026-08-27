@@ -2019,6 +2019,115 @@ def restore(ctx, dry_run):
         console.print(f"[green]All {len(restorable)} model(s) restored.[/green]")
 
 
+# ─── copy ─────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("src_backend")
+@click.argument("dst_backend")
+@click.argument("model_name")
+def copy(src_backend, dst_backend, model_name):
+    """Copy a model from one backend to another.
+
+    Copies the model files and creates a new registry entry for the destination
+    backend. The source model must exist in the registry.
+
+    Example: mr copy llamaserver llamacpp Gembrain
+    """
+    config = load_config()
+    conn = get_db(config)
+    now = now_iso()
+    
+    try:
+        # Find the source model
+        rows = conn.execute(
+            """SELECT * FROM models 
+               WHERE display_name LIKE ? AND backend=? 
+               ORDER BY display_name""",
+            (f"%{model_name}%", src_backend),
+        ).fetchall()
+        
+        if not rows:
+            console.print(f"[red]Model '{model_name}' not found in backend '{src_backend}'[/red]")
+            return
+        if len(rows) > 1:
+            console.print(f"[yellow]Multiple models match '{model_name}' in '{src_backend}':[/yellow]")
+            for i, r in enumerate(rows, 1):
+                console.print(f"  {i}. {r['display_name']}")
+            choice = click.prompt("Pick a number", type=click.IntRange(1, len(rows)))
+            row = rows[choice - 1]
+        else:
+            row = rows[0]
+        
+        console.print(f"Copying [bold]{row['display_name']}[/bold] from {src_backend} to {dst_backend}...")
+        
+        # Get file_path from source
+        src_path = Path(row["file_path"])
+        if not src_path.exists():
+            console.print(f"[red]Source file not found: {src_path}[/red]")
+            return
+        
+        # Determine destination based on backend config
+        dst_cfg = config["backends"].get(dst_backend, {})
+        if dst_backend == "ollama":
+            console.print(f"[red]Cannot copy to Ollama backend - use 'mr pull' instead[/red]")
+            return
+        
+        dst_model_dir = Path(dst_cfg.get("model_dir", ""))
+        if not dst_model_dir.exists():
+            console.print(f"[red]Destination directory does not exist: {dst_model_dir}[/red]")
+            return
+        
+        # Create destination directory
+        repo_name = src_path.parent.name
+        dst_dir = dst_model_dir / repo_name
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Copy all files from source directory
+        import shutil
+        for f in src_path.parent.glob("*"):
+            if f.is_file():
+                dest_file = dst_dir / f.name
+                console.print(f"  Copying {f.name}...")
+                shutil.copy2(f, dest_file)
+        
+        # Find the main file in destination
+        dst_files = list(dst_dir.glob("*.gguf"))
+        if not dst_files:
+            console.print(f"[red]No GGUF files found in destination directory[/red]")
+            return
+        
+        main_file = max(dst_files, key=lambda f: f.stat().st_size)
+        main_path = Path(main_file)
+        
+        # Calculate size
+        total_size = sum(f.stat().st_size for f in dst_files)
+        size_gb = round(total_size / (1024 ** 3), 2)
+        
+        # Create new registry entry
+        variant = parse_variant_from_filename(main_path.name)
+        display_name = dst_dir.name
+        
+        conn.execute(
+            """INSERT INTO models
+               (display_name, hf_repo, variant, backend, source_type,
+                file_path, size_gb, currently_local, first_seen, last_updated)
+               VALUES (?,?,?,?,?,?,?,1,?,?)""",
+            (display_name, row["hf_repo"], variant, dst_backend, dst_backend,
+             str(main_path), size_gb, now, now),
+        )
+        mid = _last_id(conn)
+        
+        conn.execute(
+            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+            (mid, "copy", now, json.dumps({"from": f"{src_backend}:{row['display_name']}", "to": f"{dst_backend}:{display_name}"})),
+        )
+        conn.commit()
+        console.print(f"[green]✓ Copied to {dst_dir} ({size_gb:.2f} GB). Registry updated.[/green]")
+        
+    finally:
+        conn.close()
+
+
 # ─── rename ───────────────────────────────────────────────────────────────────
 
 @cli.command()
