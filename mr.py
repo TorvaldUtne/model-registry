@@ -21,7 +21,7 @@ from rich.table import Table
 
 console = Console()
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
@@ -2509,7 +2509,7 @@ def enrich():
     headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     rows = conn.execute(
-        "SELECT id, hf_repo, display_name FROM models WHERE hf_repo IS NOT NULL"
+        "SELECT id, hf_repo, display_name FROM models WHERE hf_repo IS NOT NULL AND currently_local=1 AND status = 'installed'"
     ).fetchall()
 
     if not rows:
@@ -2610,7 +2610,8 @@ def enrich():
 
         # ── CivitAI enrichment phase ─────────────────────────────────────────────
         civitai_rows = conn.execute(
-            "SELECT id, display_name, source_url, source_type FROM models"
+            "SELECT id, display_name, source_url, source_type FROM models" 
+            " WHERE source_type='comfyui_civitai' AND source_url IS NOT NULL AND currently_local=1 AND status = 'installed'"
             " WHERE source_type='comfyui_civitai' AND source_url IS NOT NULL"
         ).fetchall()
 
