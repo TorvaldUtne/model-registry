@@ -354,115 +354,87 @@ def parse_variant_from_filename(filename):
 
 
 def parse_context_window_from_gguf(file_path):
-    """Extract context window from GGUF file metadata."""
-    try:
-        import struct
-    except ImportError:
+    """Extract context window and architecture from GGUF file metadata using the gguf library or raw fallback."""
+    if not file_path or not Path(file_path).exists():
         return None
 
+    # 1. Prefer standard official `gguf` library if available
     try:
+        import gguf
+        reader = gguf.GGUFReader(file_path)
+        arch = None
+        if "general.architecture" in reader.fields:
+            part = reader.fields["general.architecture"].parts[-1]
+            arch = bytes(part).decode("utf-8", errors="ignore")
+
+        if arch and f"{arch}.context_length" in reader.fields:
+            return int(reader.fields[f"{arch}.context_length"].parts[-1][0])
+
+        for k, v in reader.fields.items():
+            if k.endswith(".context_length"):
+                return int(v.parts[-1][0])
+    except Exception:
+        pass
+
+    # 2. Raw binary parser fallback
+    try:
+        import struct
         with open(file_path, "rb") as f:
-            # Read GGUF magic number
             magic = f.read(4)
             if magic != b"GGUF":
                 return None
 
-            # Read GGUF version
             version = struct.unpack("<I", f.read(4))[0]
-
-            # Read number of tensor and metadata entries
             if version >= 3:
-                f.read(8)  # skip reserved bytes
+                f.read(8)  # skip tensor count & metadata kv count header padding if needed
 
-            # Read metadata key-value pairs
-            metadata = {}
+            # Read kv pairs looking for context length
+            # Note: GGUF header stores <arch>.context_length (e.g. llama.context_length, qwen2.context_length, etc.)
             while True:
-                if version >= 3:
-                    key_type = struct.unpack("<I", f.read(4))[0]
-                else:
-                    key_type = struct.unpack("<I", f.read(4))[0]
-
-                if key_type == 0:  # GFU_KEY_END
+                key_type_bytes = f.read(4)
+                if not key_type_bytes or len(key_type_bytes) < 4:
                     break
+                key_len = struct.unpack("<Q" if version >= 3 else "<I", f.read(8 if version >= 3 else 4))[0]
+                if key_len > 256:  # sanity check
+                    break
+                key = f.read(key_len).decode("utf-8", errors="ignore")
+                val_type = struct.unpack("<I", f.read(4))[0]
 
-                # Read key
-                if version >= 3:
-                    key_len = struct.unpack("<Q", f.read(8))[0]
+                if key.endswith(".context_length") or key == "context_length":
+                    if val_type in (0, 1):  # 8-bit
+                        return struct.unpack("<B", f.read(1))[0]
+                    elif val_type in (2, 3):  # 16-bit
+                        return struct.unpack("<H", f.read(2))[0]
+                    elif val_type in (4, 5):  # 32-bit
+                        return struct.unpack("<I", f.read(4))[0]
+                    elif val_type in (10, 11):  # 64-bit
+                        return struct.unpack("<Q", f.read(8))[0]
+                    break
                 else:
-                    key_len = struct.unpack("<I", f.read(4))[0]
-
-                key = f.read(key_len).decode("utf-8")
-
-                # Read value type
-                if version >= 3:
-                    val_type = struct.unpack("<I", f.read(4))[0]
-                else:
-                    val_type = struct.unpack("<I", f.read(4))[0]
-
-                # Read value based on type
-                if val_type == 0:  # UINT8
-                    value = struct.unpack("<B", f.read(1))[0]
-                elif val_type == 1:  # INT8
-                    value = struct.unpack("<b", f.read(1))[0]
-                elif val_type == 2:  # UINT16
-                    value = struct.unpack("<H", f.read(2))[0]
-                elif val_type == 3:  # INT16
-                    value = struct.unpack("<h", f.read(2))[0]
-                elif val_type == 4:  # UINT32
-                    value = struct.unpack("<I", f.read(4))[0]
-                elif val_type == 5:  # INT32
-                    value = struct.unpack("<i", f.read(4))[0]
-                elif val_type == 6:  # FLOAT32
-                    value = struct.unpack("<f", f.read(4))[0]
-                elif val_type == 7:  # BOOL
-                    value = struct.unpack("<B", f.read(1))[0] == 1
-                elif val_type == 8:  # STRING
-                    if version >= 3:
-                        str_len = struct.unpack("<Q", f.read(8))[0]
-                    else:
-                        str_len = struct.unpack("<I", f.read(4))[0]
-                    value = f.read(str_len).decode("utf-8")
-                elif val_type == 9:  # ARRAY
-                    # Skip arrays for now
-                    array_type = struct.unpack("<I", f.read(4))[0]
-                    if version >= 3:
-                        array_len = struct.unpack("<Q", f.read(8))[0]
-                    else:
-                        array_len = struct.unpack("<I", f.read(4))[0]
-                    # Skip array data
-                    for _ in range(array_len):
-                        if array_type == 8:  # STRING array
-                            if version >= 3:
-                                str_len = struct.unpack("<Q", f.read(8))[0]
-                            else:
-                                str_len = struct.unpack("<I", f.read(4))[0]
-                            f.read(str_len)
+                    # Skip values according to type
+                    type_sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+                    if val_type in type_sizes:
+                        f.read(type_sizes[val_type])
+                    elif val_type == 8:  # string
+                        slen = struct.unpack("<Q" if version >= 3 else "<I", f.read(8 if version >= 3 else 4))[0]
+                        f.read(slen)
+                    elif val_type == 9:  # array
+                        atype = struct.unpack("<I", f.read(4))[0]
+                        alen = struct.unpack("<Q" if version >= 3 else "<I", f.read(8 if version >= 3 else 4))[0]
+                        if atype == 8:
+                            for _ in range(alen):
+                                slen = struct.unpack("<Q" if version >= 3 else "<I", f.read(8 if version >= 3 else 4))[0]
+                                f.read(slen)
+                        elif atype in type_sizes:
+                            f.read(type_sizes[atype] * alen)
                         else:
-                            # Skip primitive types
-                            sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1}
-                            f.read(sizes.get(array_type, 0))
-                else:
-                    break
+                            break
+                    else:
+                        break
+    except Exception:
+        pass
 
-                metadata[key] = value
-
-            # Look for context window
-            context_keys = [
-                "llama.context_length",
-                "context_length",
-                "llama.context_length_train",
-                "rope.freq_base"
-            ]
-            for key in context_keys:
-                if key in metadata:
-                    value = metadata[key]
-                    if isinstance(value, int):
-                        return value
-
-            return None
-    except Exception as e:
-        console.print(f"[yellow]  Warning: Could not parse GGUF context window from {file_path}: {e}[/yellow]")
-        return None
+    return None
 
 
 # ─── CivitAI / AIR helpers ───────────────────────────────────────────────────
@@ -1048,19 +1020,25 @@ def scan():
             seen_paths.add(fpath)
             size_gb = round(f.stat().st_size / (1024 ** 3), 4)
             variant = parse_variant_from_filename(f.name)
+            context_window = parse_context_window_from_gguf(fpath)
 
             existing = conn.execute(
                 "SELECT * FROM models WHERE file_path=?", (fpath,)
             ).fetchone()
 
             if existing:
+                update_fields = {"size_gb": size_gb, "currently_local": 1, "last_updated": now}
+                if context_window is not None:
+                    update_fields["context_window"] = context_window
+                set_clauses = [f"{k}=?" for k in update_fields.keys()]
+                params = list(update_fields.values()) + [existing["id"]]
                 conn.execute(
-                    "UPDATE models SET size_gb=?, currently_local=1, last_updated=? WHERE id=?",
-                    (size_gb, now, existing["id"]),
+                    f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
+                    params,
                 )
                 conn.execute(
                     "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                    (existing["id"], "scan_updated", now, json.dumps({"size_gb": size_gb})),
+                    (existing["id"], "scan_updated", now, json.dumps(update_fields)),
                 )
                 updated += 1
             else:
@@ -1645,9 +1623,17 @@ def enrich(enrich_all):
 
             # Context window
             if row["context_window"] is None:
-                ctx = get_hf_context_window(row["hf_repo"], hf_token)
-                if ctx is not None:
-                    update_fields["context_window"] = ctx
+                # First try local GGUF file if path exists
+                if row["file_path"] and Path(row["file_path"]).exists():
+                    ctx = parse_context_window_from_gguf(row["file_path"])
+                    if ctx is not None:
+                        update_fields["context_window"] = ctx
+
+                # If still not found, try Hugging Face
+                if "context_window" not in update_fields and row["hf_repo"]:
+                    ctx = get_hf_context_window(row["hf_repo"], hf_token)
+                    if ctx is not None:
+                        update_fields["context_window"] = ctx
 
             # Metadata from HF API
             if any(row[k] is None for k in ("param_count", "architecture", "hf_downloads", "hf_likes", "hf_last_modified")):
