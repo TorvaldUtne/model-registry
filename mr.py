@@ -154,7 +154,8 @@ def find_model(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
 
     console.print(f"[yellow]Multiple models match '{name}':[/yellow]")
     for i, row in enumerate(rows, 1):
-        console.print(f"  {i}. {row['display_name']}  [{row['backend']}]")
+        local_status = "(local)" if row["currently_local"] else "(remote)"
+        console.print(f"  {i}. {row['display_name']}  [{row['backend']}] {local_status}")
     choice = click.prompt("Pick a number", type=click.IntRange(1, len(rows)))
     return rows[choice - 1]
 
