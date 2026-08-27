@@ -917,6 +917,7 @@ def list_models(backend, status, unrated, show_all, deleted):
     table.add_column("Rating", width=7, justify="center")
     table.add_column("Size", width=9, justify="right")
     table.add_column("Last Used", width=12)
+    table.add_column("Tags", width=30)
 
     for row in rows:
         status_val = row["status"] or "unrated"
@@ -937,6 +938,14 @@ def list_models(backend, status, unrated, show_all, deleted):
             except ValueError:
                 pass
 
+        tags_str = ""
+        if row["tags"]:
+            try:
+                tags = json.loads(row["tags"])
+                tags_str = ", ".join(tags)
+            except json.JSONDecodeError:
+                tags_str = row["tags"]
+
         not_local = "" if row["currently_local"] else " [dim](not local)[/dim]"
         row_cells = [f"[{color}]{row['display_name']}{not_local}[/{color}]"]
         if backend != "comfyui":
@@ -948,6 +957,7 @@ def list_models(backend, status, unrated, show_all, deleted):
             rating_str,
             size_str,
             last_used or "-",
+            tags_str,
         ]
         table.add_row(*row_cells)
 
@@ -1798,6 +1808,87 @@ def removeall(dry_run):
     console.print(f"\n[green]✓ Removed {removed} model(s) from registry.[/green]")
 
 
+# ─── tag ──────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("model")
+@click.argument("tags", nargs=-1)
+def tag(model, tags):
+    """Add tags to a model. Multiple tags can be provided."""
+    config = load_config()
+    conn = get_db(config)
+    row = find_model(conn, model)
+    now = now_iso()
+    try:
+        current_tags = []
+        if row["tags"]:
+            try:
+                current_tags = json.loads(row["tags"])
+            except json.JSONDecodeError:
+                current_tags = [row["tags"]]
+
+        new_tags = list(tags)
+        for t in new_tags:
+            if t not in current_tags:
+                current_tags.append(t)
+
+        conn.execute(
+            "UPDATE models SET tags=?, last_updated=? WHERE id=?",
+            (json.dumps(current_tags), now, row["id"]),
+        )
+        conn.execute(
+            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+            (row["id"], "tag", now, json.dumps(current_tags)),
+        )
+        conn.commit()
+        console.print(f"[green]✓ Tags updated: {', '.join(current_tags)}[/green]")
+    finally:
+        conn.close()
+
+
+# ─── untag ────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("model")
+@click.argument("tags", nargs=-1)
+def untag(model, tags):
+    """Remove tags from a model. If no tags provided, removes all tags."""
+    config = load_config()
+    conn = get_db(config)
+    row = find_model(conn, model)
+    now = now_iso()
+    try:
+        current_tags = []
+        if row["tags"]:
+            try:
+                current_tags = json.loads(row["tags"])
+            except json.JSONDecodeError:
+                current_tags = [row["tags"]]
+
+        if not tags:
+            current_tags = []
+        else:
+            for t in tags:
+                if t in current_tags:
+                    current_tags.remove(t)
+
+        conn.execute(
+            "UPDATE models SET tags=?, last_updated=? WHERE id=?",
+            (json.dumps(current_tags) if current_tags else None, now, row["id"]),
+        )
+        conn.execute(
+            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+            (row["id"], "untag", now, json.dumps(current_tags) if current_tags else None),
+        )
+        conn.commit()
+        if current_tags:
+            console.print(f"[green]✓ Tags updated: {', '.join(current_tags)}[/green]")
+        else:
+            console.print("[green]✓ All tags removed.[/green]")
+    finally:
+        conn.close()
+
+
 # ─── restore ──────────────────────────────────────────────────────────────────
 
 @cli.command()
@@ -2296,15 +2387,15 @@ def enrich():
 @cli.command()
 @click.argument("term")
 def search(term):
-    """Search local registry by name, hf_repo, or notes."""
+    """Search local registry by name, hf_repo, notes, or tags."""
     config = load_config()
     conn = get_db(config)
 
     rows = conn.execute(
         """SELECT * FROM models
-           WHERE display_name LIKE ? OR hf_repo LIKE ? OR notes LIKE ?
+           WHERE display_name LIKE ? OR hf_repo LIKE ? OR notes LIKE ? OR tags LIKE ?
            ORDER BY display_name""",
-        (f"%{term}%", f"%{term}%", f"%{term}%"),
+        (f"%{term}%", f"%{term}%", f"%{term}%", f"%{term}%"),
     ).fetchall()
     conn.close()
 
