@@ -1131,9 +1131,12 @@ def show(model):
     if row["file_path"]:
         lines.append(f"[bold]File:[/bold]       {row['file_path']}")
     lines.append(f"[bold]Size:[/bold]       {row['size_gb']:.2f} GB" if row["size_gb"] is not None else "[bold]Size:[/bold]       -")
-    context_window = row.get("context_window")
-    if context_window:
-        lines.append(f"[bold]Context:[/bold]    {context_window:,} tokens")
+    try:
+        context_window = row["context_window"]
+        if context_window:
+            lines.append(f"[bold]Context:[/bold]    {context_window:,} tokens")
+    except (KeyError, TypeError):
+        pass  # context_window column doesn't exist in older DBs
     lines.append(f"[bold]Local:[/bold]      {'yes' if row['currently_local'] else 'no'}")
     lines.append(f"[bold]Downloads:[/bold]  {row['times_downloaded']}")
     if tags:
