@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import click
-from huggingface_hub import AutoConfig
+from huggingface_hub import hf_hub_download
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
@@ -22,7 +22,7 @@ from rich.table import Table
 
 console = Console()
 
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
@@ -244,18 +244,30 @@ def get_hf_context_window(hf_repo, hf_token):
     if not hf_repo:
         return None
     try:
-        config = AutoConfig.from_pretrained(hf_repo, token=hf_token)
+        # We don't want to introduce a heavy dependency like `transformers`
+        # so we manually download and parse config.json
+        from huggingface_hub import hf_hub_download
+        import json
+        import requests
+
+        # Try to download config.json
+        config_path = hf_hub_download(repo_id=hf_repo, filename="config.json", token=hf_token)
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
         # Common keys for context window
         context_keys = [
             "max_position_embeddings",
             "max_sequence_length",
             "n_ctx",
+            "seq_length",
+            "max_seq_len",
+            "sliding_window",
+            "context_length",
         ]
         for key in context_keys:
-            if hasattr(config, key):
-                value = getattr(config, key)
-                if isinstance(value, int):
-                    return value
+            if key in config and isinstance(config[key], int):
+                return config[key]
         return None
     except Exception:
         return None
