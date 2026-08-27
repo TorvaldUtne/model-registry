@@ -1290,10 +1290,11 @@ def report():
 
 @cli.command()
 @click.argument("ref")
+@click.argument("variant", required=False)
 @click.option("--backend", type=str, default=None)
 @click.option("--file", "file_pattern", default=None, help="Glob pattern for file in HF repo")
 @click.option("--subdir", default=None, help="ComfyUI subdir to save into (e.g. checkpoints, loras)")
-def pull(ref, backend, file_pattern, subdir):
+def pull(ref, variant, backend, file_pattern, subdir):
     """Pull a model. Warns if blacklisted or previously deleted.
 
     For ComfyUI models, --subdir is required. Supports HuggingFace repos
@@ -1302,11 +1303,23 @@ def pull(ref, backend, file_pattern, subdir):
     For GGUF (llama.cpp) models, when multiple .gguf files exist, all files will
     be downloaded to a subdirectory named after the repo. Use --file with a glob
     pattern to download specific files instead.
+
+    NEW: For HF downloads with multiple GGUF files, you can specify the variant
+    as a second argument: mr pull org/repo Q5_K_M (instead of org/repo:Q5_K_M)
     """
     config = load_config()
     conn = get_db(config)
     init_db(conn)
     now = now_iso()
+
+    # Handle new syntax: if variant provided, construct ref as org/repo:variant
+    if variant and not re.search(r"(?:hf\.co|huggingface\.co)/", ref, re.IGNORECASE):
+        if "/" in ref:
+            ref = f"{ref}:{variant}"
+        elif backend in get_gguf_backend_names(config):
+            console.print(f"[red]For {backend}, ref must be 'org/repo' format when using variant argument.[/red]")
+            conn.close()
+            return
 
     # Auto-detect backend
     if backend is None:
