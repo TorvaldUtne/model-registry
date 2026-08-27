@@ -2003,25 +2003,19 @@ def delete(model):
 @cli.command()
 @click.argument("model")
 def remove(model):
-    """Remove a model from the registry (soft delete). Keeps DB record, sets status=deleted."""
+    """Remove a model from the registry (hard delete). Completely removes the DB entry."""
     config = load_config()
     conn = get_db(config)
     row = find_model(conn, model)
     now = now_iso()
     try:
-        if not click.confirm(f"Remove '{row['display_name']}' from registry?", default=False):
+        if not click.confirm(f"Delete '{row['display_name']}' from registry?", default=False):
             return
 
-        conn.execute(
-            "UPDATE models SET status='deleted', last_updated=? WHERE id=?",
-            (now, row["id"]),
-        )
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "remove", now, None),
-        )
+        conn.execute("DELETE FROM events WHERE model_id=?", (row["id"],))
+        conn.execute("DELETE FROM models WHERE id=?", (row["id"],))
         conn.commit()
-        console.print("[green]✓ Model removed from registry (status=deleted).[/green]")
+        console.print("[green]✓ Model deleted from registry.[/green]")
     finally:
         conn.close()
 
