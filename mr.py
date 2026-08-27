@@ -21,7 +21,7 @@ from rich.table import Table
 
 console = Console()
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
