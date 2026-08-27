@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import click
+from huggingface_hub import AutoConfig
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
@@ -21,7 +22,7 @@ from rich.table import Table
 
 console = Console()
 
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
@@ -237,6 +238,27 @@ def parse_ollama_list_lines(lines):
         size_gb = parse_ollama_size(parts[2] + " " + parts[3])
         models.append({"ollama_name": name, "size_gb": size_gb})
     return models
+
+def get_hf_context_window(hf_repo, hf_token):
+    """Fetch context window from HuggingFace model config."""
+    if not hf_repo:
+        return None
+    try:
+        config = AutoConfig.from_pretrained(hf_repo, token=hf_token)
+        # Common keys for context window
+        context_keys = [
+            "max_position_embeddings",
+            "max_sequence_length",
+            "n_ctx",
+        ]
+        for key in context_keys:
+            if hasattr(config, key):
+                value = getattr(config, key)
+                if isinstance(value, int):
+                    return value
+        return None
+    except Exception:
+        return None
 
 
 # ─── llama.cpp helpers ────────────────────────────────────────────────────────
@@ -755,6 +777,7 @@ def scan():
 
     # ── Ollama ──────────────────────────────────────────────────────────────
     ollama_cfg = config["backends"].get("ollama", {})
+    hf_token = os.environ.get(config.get("huggingface", {}).get("token_env_var"))
     if ollama_cfg.get("enabled", False):
         container = ollama_cfg.get("docker_container", "ollama")
         console.print(f"Scanning Ollama (container: [bold]{container}[/bold])...")
@@ -770,7 +793,9 @@ def scan():
                 size_gb = om["size_gb"]
                 hf_repo, variant = parse_hf_repo_from_ollama(oname)
                 source_type = get_source_type(oname)
-
+                context_window = None
+                if hf_repo:
+                    context_window = get_hf_context_window(hf_repo, hf_token)
                 # Deduplicate: same hf_repo already registered this scan pass
                 if hf_repo and hf_repo in seen_hf_repos:
                     console.print(
@@ -795,29 +820,39 @@ def scan():
                     ).fetchone()
 
                 if existing:
+                    update_fields = {"size_gb": size_gb, "currently_local": 1, "last_updated": now, "ollama_name": oname}
+                    if context_window is not None:
+                        update_fields["context_window"] = context_window
+                    
+                    set_clauses = [f"{k}=?" for k in update_fields.keys()]
+                    params = list(update_fields.values()) + [existing["id"]]
+                    
                     conn.execute(
-                        """UPDATE models
-                           SET size_gb=?, currently_local=1, last_updated=?, ollama_name=?
-                           WHERE id=?""",
-                        (size_gb, now, oname, existing["id"]),
+                        f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
+                        params,
                     )
+                    
+                    event_detail = {"size_gb": size_gb, "ollama_name": oname}
+                    if context_window is not None:
+                        event_detail["context_window"] = context_window
+                    
                     conn.execute(
                         "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                        (existing["id"], "scan_updated", now, json.dumps({"size_gb": size_gb})),
+                        (existing["id"], "scan_updated", now, json.dumps(event_detail)),
                     )
                     updated += 1
                 else:
                     conn.execute(
                         """INSERT INTO models
                            (display_name, hf_repo, variant, backend, source_type,
-                            ollama_name, size_gb, currently_local, first_seen, last_updated)
-                           VALUES (?,?,?,?,?,?,?,1,?,?)""",
-                        (oname, hf_repo, variant, "ollama", source_type, oname, size_gb, now, now),
+                            ollama_name, size_gb, context_window, currently_local, first_seen, last_updated)
+                           VALUES (?,?,?,?,?,?,?,?,1,?,?)""",
+                        (oname, hf_repo, variant, "ollama", source_type, oname, size_gb, context_window, now, now),
                     )
                     mid = _last_id(conn)
                     conn.execute(
                         "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                        (mid, "scan_added", now, json.dumps({"ollama_name": oname})),
+                        (mid, "scan_added", now, json.dumps({"ollama_name": oname, "context_window": context_window})),
                     )
                     added += 1
 
@@ -890,13 +925,26 @@ def scan():
             ).fetchone()
 
             if existing:
+                context_window = parse_context_window_from_gguf(fpath)
+                update_fields = {"size_gb": size_gb, "currently_local": 1, "last_updated": now, "variant": variant}
+                if context_window is not None:
+                    update_fields["context_window"] = context_window
+                
+                set_clauses = [f"{k}=?" for k in update_fields.keys()]
+                params = list(update_fields.values()) + [existing["id"]]
+                
                 conn.execute(
-                    "UPDATE models SET size_gb=?, currently_local=1, last_updated=?, variant=? WHERE id=?",
-                    (size_gb, now, variant, existing["id"]),
+                    f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
+                    params,
                 )
+                
+                event_detail = {"size_gb": size_gb, "variant": variant}
+                if context_window is not None:
+                    event_detail["context_window"] = context_window
+                
                 conn.execute(
                     "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                    (existing["id"], "scan_updated", now, json.dumps({"size_gb": size_gb, "variant": variant})),
+                    (existing["id"], "scan_updated", now, json.dumps(event_detail)),
                 )
                 updated += 1
             else:
