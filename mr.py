@@ -290,45 +290,49 @@ def get_hf_context_window(hf_repo, hf_token):
     if not hf_repo:
         return None
     try:
-        from huggingface_hub import hf_hub_download, HfHub
+        from huggingface_hub import hf_hub_download, HfApi
         import json
         import requests
 
-        from huggingface_hub.utils import HfHubHTTPError
-        
         def _get_context_from_config(repo, token):
             try:
                 config_path = hf_hub_download(repo_id=repo, filename="config.json", token=token)
                 with open(config_path, "r") as f:
                     config = json.load(f)
-                for key in ["max_position_embeddings", "max_sequence_length", "n_ctx", "seq_length", "max_seq_len", "sliding_window", "context_length"]:# noqa: E501
+                for key in ["max_position_embeddings", "max_sequence_length", "n_ctx", "seq_length", "max_seq_len", "sliding_window", "context_length"]:
                     if key in config and isinstance(config[key], int):
                         return config[key]
-            except HfHubHTTPError as e:
-                if e.response.status_code == 404:
-                    return None # config.json not found
-                raise
             except Exception:
-                raise
+                return None
 
-        # Try the given hf_repo first
+        # 1. Try repo itself
+        ctx = _get_context_from_config(hf_repo, hf_token)
+        if ctx is not None:
+            return ctx
+
+        # 2. Check base_model from model card/tags
         try:
-            ctx = _get_context_from_config(hf_repo, hf_token)
-            if ctx is not None:
-                return ctx
-        except Exception:
-            pass # Continue to try base repo
+            api = HfApi(token=hf_token)
+            info = api.model_info(hf_repo)
+            # Check card_data for base_model
+            card_data = getattr(info, "card_data", None) or getattr(info, "cardData", None)
+            base_models = []
+            if card_data and getattr(card_data, "base_model", None):
+                bm = card_data.base_model
+                if isinstance(bm, list):
+                    base_models.extend(bm)
+                elif isinstance(bm, str):
+                    base_models.append(bm)
+            for tag in getattr(info, "tags", []):
+                if tag.startswith("base_model:"):
+                    base_models.append(tag.split(":", 1)[1].replace("quantized:", ""))
 
-        # If not found, try stripping the last path segment (e.g., bartowski/Ling-3.0-tiny-GGUF -> inclusionAI/Ling-3.0-tiny)
-        parts = hf_repo.split('/')
-        if len(parts) > 2: # e.g. "org/repo/subrepo"
-            base_repo = "/".join(parts[:-1])
-            try:
-                ctx = _get_context_from_config(base_repo, hf_token)
+            for bm in base_models:
+                ctx = _get_context_from_config(bm, hf_token)
                 if ctx is not None:
                     return ctx
-            except Exception:
-                pass # Couldn't find in base repo either
+        except Exception:
+            pass
 
         return None
     except Exception as e:
@@ -1653,7 +1657,11 @@ def enrich(enrich_all):
                         if v is not None and row[k] is None:
                             update_fields[k] = v
 
-            if update_fields:
+                # Convert any datetime objects to ISO strings
+                for k, v in list(update_fields.items()):
+                    if isinstance(v, datetime):
+                        update_fields[k] = v.isoformat()
+
                 update_fields["last_updated"] = now
                 set_clauses = [f"{k}=?" for k in update_fields.keys()]
                 params = list(update_fields.values()) + [row["id"]]
