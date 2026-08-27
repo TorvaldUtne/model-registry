@@ -13,12 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import click
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, HfApi
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
+import requests
 
 console = Console()
 
@@ -239,37 +240,83 @@ def parse_ollama_list_lines(lines):
         models.append({"ollama_name": name, "size_gb": size_gb})
     return models
 
-def get_hf_context_window(hf_repo, hf_token):
-    """Fetch context window from HuggingFace model config."""
+def get_hf_metadata(hf_repo, hf_token):
+    \"\"\"Fetch metadata (param_count, architecture, downloads, likes, last_modified) from HuggingFace model card.\"\"\"
     if not hf_repo:
-        return None
+        return {}
     try:
-        # We don't want to introduce a heavy dependency like `transformers`
-        # so we manually download and parse config.json
+        from huggingface_hub import HfApi
+        hf_api = HfApi(token=hf_token)
+        model_info = hf_api.get_model_info(hf_repo)
+
+        metadata = {}
+        # Param count: usually in model_info.cardData.model_parameters or similar
+        # This is often not directly available or in a consistent format from get_model_info
+        # For now, we\'ll try common keys. More robust parsing might involve downloading
+        # the model card and parsing it.
+        if hasattr(model_info, \'safetensors\') and model_info.safetensors and isinstance(model_info.safetensors, dict):
+            # Try to get param_count from safetensors metadata
+            for key in [\"total_params\", \"num_params\"]:\
+                if key in model_info.safetensors:\
+                    metadata[\"param_count\"] = model_info.safetensors[key]
+                    break
+        
+        # Architecture
+        if hasattr(model_info, \'cardData\') and model_info.cardData and isinstance(model_info.cardData, dict):\
+            if \"architectures\" in model_info.cardData and isinstance(model_info.cardData[\"architectures\"], list) and model_info.cardData[\"architectures\"]:\
+                metadata[\"architecture\"] = model_info.cardData[\"architectures\"][0]
+            elif \"model_name\" in model_info.cardData: # sometimes architecture is part of name
+                name_lower = model_info.cardData[\"model_name\"].lower()
+                if \"llama\" in name_lower:
+                    metadata[\"architecture\"] = \"Llama\"
+                elif \"mistral\" in name_lower:
+                    metadata[\"architecture\"] = \"Mistral\"
+
+        # Downloads and Likes
+        metadata[\"hf_downloads\"] = model_info.downloads
+        metadata[\"hf_likes\"] = model_info.likes
+        
+        # Last modified
+        metadata[\"hf_last_modified\"] = model_info.lastModified
+
+        return metadata
+
+    except Exception as e:
+        console.print(f\"[yellow]  Warning: Could not fetch HF metadata for {hf_repo}: {e}[/yellow]\")
+        return {}
+
+def get_hf_context_window(hf_repo, hf_token):\
+    \"\"\"Fetch context window from HuggingFace model config.\"\"\"\
+    if not hf_repo:\
+        return None
+    try:\
+        # We don\'t want to introduce a heavy dependency like `transformers`\
+        # so we manually download and parse config.json\
         from huggingface_hub import hf_hub_download
         import json
         import requests
 
         # Try to download config.json
-        config_path = hf_hub_download(repo_id=hf_repo, filename="config.json", token=hf_token)
-        with open(config_path, "r") as f:
+        config_path = hf_hub_download(repo_id=hf_repo, filename=\"config.json\", token=hf_token)
+        with open(config_path, \"r\") as f:
             config = json.load(f)
 
         # Common keys for context window
         context_keys = [
-            "max_position_embeddings",
-            "max_sequence_length",
-            "n_ctx",
-            "seq_length",
-            "max_seq_len",
-            "sliding_window",
-            "context_length",
+            \"max_position_embeddings\",
+            \"max_sequence_length\",
+            \"n_ctx\",
+            \"seq_length\",
+            \"max_seq_len\",
+            \"sliding_window\",
+            \"context_length\",
         ]
         for key in context_keys:
             if key in config and isinstance(config[key], int):
                 return config[key]
         return None
-    except Exception:
+    except Exception as e:
+        console.print(f\"[yellow]  Warning: Could not fetch HF context window for {hf_repo}: {e}[/yellow]\")
         return None
 
 
@@ -393,7 +440,8 @@ def parse_context_window_from_gguf(file_path):
                         return value
             
             return None
-    except Exception:
+    except Exception as e:
+        console.print(f"[yellow]  Warning: Could not parse GGUF context window from {file_path}: {e}[/yellow]")
         return None
 
 
@@ -1201,11 +1249,11 @@ def show(model):
         lines.append(f"[bold]Updated:[/bold]    {row['last_updated']}")
 
     # Phase 3 HF enrichment fields
-    if any(row[k] is not None for k in ("param_count", "architecture", "hf_downloads", "hf_likes")):
+    if any(row[k] is not None for k in ("param_count", "architecture", "hf_downloads", "hf_likes", "hf_last_modified")):
         lines.append("")
         lines.append("[bold dim]─── HF Metadata ───[/bold dim]")
-        if row["param_count"]:
-            lines.append(f"[bold]Params:[/bold]     {row['param_count']}")
+        if row["param_count"] is not None: # Check for None explicitly, as it could be 0
+            lines.append(f"[bold]Params:[/bold]     {row['param_count']:,}")
         if row["architecture"]:
             lines.append(f"[bold]Arch:[/bold]       {row['architecture']}")
         if row["hf_downloads"] is not None:
@@ -1465,6 +1513,128 @@ def report():
             )
 
     conn.close()
+
+
+# ─── enrich ───────────────────────────────────────────────────────────────────
+
+def get_hf_metadata(hf_repo, hf_token):
+    """Fetch metadata (param_count, architecture, downloads, likes, last_modified) from HuggingFace model card."""
+    if not hf_repo:
+        return {}
+    try:
+        from huggingface_hub import HfApi
+        hf_api = HfApi(token=hf_token)
+        model_info = hf_api.get_model_info(hf_repo)
+
+        metadata = {}
+        # Param count: usually in model_info.cardData.model_parameters or similar
+        # This is often not directly available or in a consistent format from get_model_info
+        # For now, we'll try common keys. More robust parsing might involve downloading
+        # the model card and parsing it.
+        if hasattr(model_info, 'safetensors') and model_info.safetensors and isinstance(model_info.safetensors, dict):
+            # Try to get param_count from safetensors metadata
+            for key in ["total_params", "num_params"]:
+                if key in model_info.safetensors:
+                    metadata["param_count"] = model_info.safetensors[key]
+                    break
+        
+        # Architecture
+        if hasattr(model_info, 'cardData') and model_info.cardData and isinstance(model_info.cardData, dict):
+            if "architectures" in model_info.cardData and isinstance(model_info.cardData["architectures"], list) and model_info.cardData["architectures"]:
+                metadata["architecture"] = model_info.cardData["architectures"][0]
+            elif "model_name" in model_info.cardData: # sometimes architecture is part of name
+                name_lower = model_info.cardData["model_name"].lower()
+                if "llama" in name_lower:
+                    metadata["architecture"] = "Llama"
+                elif "mistral" in name_lower:
+                    metadata["architecture"] = "Mistral"
+
+        # Downloads and Likes
+        metadata["hf_downloads"] = model_info.downloads
+        metadata["hf_likes"] = model_info.likes
+        
+        # Last modified
+        metadata["hf_last_modified"] = model_info.lastModified
+
+        return metadata
+
+    except Exception as e:
+        console.print(f"[yellow]  Warning: Could not fetch HF metadata for {hf_repo}: {e}[/yellow]")
+        return {}
+
+@cli.command()
+def enrich():
+    """Fetch additional metadata (e.g., context window, param count) from HuggingFace Hub for models with hf_repo.
+
+    Only enriches models that are currently local and have an hf_repo but are missing enrichment data.
+    """
+    config = load_config()
+    conn = get_db(config)
+    init_db(conn)
+    now = now_iso()
+    hf_token = os.environ.get(config.get("huggingface", {}).get("token_env_var"))
+
+    # Select models that are local, have an hf_repo, and are missing context_window or other enrichment data
+    # (param_count, architecture, hf_downloads, hf_likes, hf_last_modified)
+    rows = conn.execute("""
+        SELECT id, hf_repo, backend, file_path, ollama_name
+        FROM models
+        WHERE hf_repo IS NOT NULL AND currently_local=1
+          AND (context_window IS NULL OR param_count IS NULL OR architecture IS NULL OR hf_downloads IS NULL)
+        ORDER BY display_name
+    """).fetchall()
+
+    if not rows:
+        console.print("[green]No models needing enrichment found.[/green]")
+        conn.close()
+        return
+
+    console.print(f"[bold]Enriching {len(rows)} model(s) from HuggingFace Hub...[/bold]")
+
+    updated_count = 0
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Enriching models", total=len(rows))
+        for row in rows:
+            progress.update(task, description=f"Enriching [bold]{row['hf_repo']}[/bold]")
+            
+            update_fields = {}
+            # Context window
+            if row["context_window"] is None:
+                context_window = get_hf_context_window(row["hf_repo"], hf_token)
+                if context_window is not None:
+                    update_fields["context_window"] = context_window
+            
+            # Other HF metadata
+            if row["param_count"] is None or row["architecture"] is None or row["hf_downloads"] is None:
+                metadata = get_hf_metadata(row["hf_repo"], hf_token)
+                if metadata:
+                    for k in ["param_count", "architecture", "hf_downloads", "hf_likes", "hf_last_modified"]:
+                        if k in metadata and row[k] is None: # Only update if not already set
+                            update_fields[k] = metadata[k]
+
+            if update_fields:
+                set_clauses = [f"{k}=?" for k in update_fields.keys()]
+                params = list(update_fields.values()) + [now, row["id"]]
+                conn.execute(
+                    f"UPDATE models SET {', '.join(set_clauses)}, last_updated=? WHERE id=?",
+                    params,
+                )
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (row["id"], "enrich_updated", now, json.dumps(update_fields)),
+                )
+                updated_count += 1
+            progress.advance(task)
+
+    conn.commit()
+    conn.close()
+    console.print(f"\n[green]Enrichment complete.[/green] Updated: [bold]{updated_count}[/bold] model(s).")
 
 
 # ─── pull ─────────────────────────────────────────────────────────────────────
