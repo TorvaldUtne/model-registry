@@ -21,6 +21,8 @@ from rich.table import Table
 
 console = Console()
 
+__version__ = "1.0.0"
+
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 CONFIG_EXAMPLE = SCRIPT_DIR / "config.example.json"
@@ -2561,4 +2563,8 @@ def search(term):
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        console.print(f"[bold]Model Registry v{__version__}[/bold]")
+        console.print("Run [bold]mr --help[/bold] for available commands.")
+        sys.exit(0)
     cli()
