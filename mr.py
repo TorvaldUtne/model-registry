@@ -489,6 +489,17 @@ def cli():
     pass
 
 
+@cli.command()
+def backends():
+    """List configured backend names."""
+    config = load_config()
+    backends = list(config.get("backends", {}).keys())
+    console.print(f"[bold]Configured backends:[/bold]")
+    for b in backends:
+        status = "enabled" if config["backends"][b].get("enabled", False) else "disabled"
+        console.print(f"  - {b} [dim]({status})[/dim]")
+
+
 # ─── init ─────────────────────────────────────────────────────────────────────
 
 @cli.command()
@@ -865,19 +876,22 @@ def scan():
 )
 @click.option("--unrated", is_flag=True, default=False, help="Show only models with no rating")
 @click.option("--all", "show_all", is_flag=True, default=False, help="Include non-local and blacklisted models")
-def list_models(backend, status, unrated, show_all):
+@click.option("--deleted", is_flag=True, default=False, help="Show only deleted models")
+def list_models(backend, status, unrated, show_all, deleted):
     """List models in the registry. By default shows only locally installed, non-blacklisted models."""
     config = load_config()
     conn = get_db(config)
 
     query = "SELECT * FROM models WHERE 1=1"
     params = []
-    if not show_all:
+    if deleted:
+        query += " AND status='deleted'"
+    elif not show_all:
         query += " AND currently_local=1 AND status != 'blacklisted'"
     if backend:
         query += " AND backend=?"
         params.append(backend)
-    if status:
+    if status and not deleted:
         query += " AND status=?"
         params.append(status)
     if unrated:
@@ -1735,6 +1749,55 @@ def pull(ref, backend, file_pattern, subdir):
     conn.close()
 
 
+# ─── removeall ────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Show what would be removed without actually removing")
+def removeall(dry_run):
+    """Remove all models with status='deleted' from the registry."""
+    config = load_config()
+    conn = get_db(config)
+    init_db(conn)
+    now = now_iso()
+
+    deleted = conn.execute(
+        "SELECT * FROM models WHERE status='deleted' ORDER BY display_name"
+    ).fetchall()
+
+    conn.close()
+
+    if not deleted:
+        console.print("[green]No deleted models found.[/green]")
+        return
+
+    if dry_run:
+        console.print(f"[yellow]Would remove {len(deleted)} model(s):[/yellow]")
+        for row in deleted:
+            console.print(f"  - {row['display_name']} [{row['backend']}]")
+        return
+
+    if not click.confirm(f"Remove {len(deleted)} model(s) from registry?", default=False):
+        return
+
+    removed = 0
+    for row in deleted:
+        conn = get_db(config)
+        conn.execute(
+            "UPDATE models SET status='deleted', last_updated=? WHERE id=?",
+            (now, row["id"]),
+        )
+        conn.execute(
+            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+            (row["id"], "removeall", now, None),
+        )
+        conn.commit()
+        conn.close()
+        removed += 1
+        console.print(f"  [green]✓[/green] {row['display_name']}")
+
+    console.print(f"\n[green]✓ Removed {removed} model(s) from registry.[/green]")
+
+
 # ─── restore ──────────────────────────────────────────────────────────────────
 
 @cli.command()
@@ -1839,54 +1902,50 @@ def restore(ctx, dry_run):
 @click.argument("model")
 @click.argument("new_name")
 def rename(model, new_name):
-    """Rename a model file and registry entry, keeping all metadata intact.
+    """Rename a model directory only. Keeps model name and metadata intact.
 
-    NEW_NAME should be given without the file extension — the extension is
-    preserved automatically.  display_name and file_path are updated; all
-    other fields (source_url, ratings, notes, events, etc.) are unchanged.
+    Only the directory name is changed on disk. The display_name in the registry
+    remains unchanged. Use this when you want to reorganize your file structure
+    without altering the logical model name.
     """
     config = load_config()
     conn = get_db(config)
     row = find_model(conn, model)
     now = now_iso()
     try:
-        old_display = row["display_name"]
+        if row["backend"] == "ollama":
+            console.print("[yellow]Ollama models don't have directories to rename.[/yellow]")
+            return
 
-        if row["backend"] != "ollama":
-            if not row["file_path"]:
-                console.print("[red]No file_path recorded for this model — cannot rename on disk.[/red]")
+        if not row["file_path"]:
+            console.print("[red]No file_path recorded for this model — cannot rename on disk.[/red]")
+            return
+
+        old_path = Path(row["file_path"])
+        if not old_path.exists():
+            console.print(f"[yellow]File not found on disk: {old_path}[/yellow]")
+            if not click.confirm("Update registry file_path anyway?", default=False):
                 return
-            old_path = Path(row["file_path"])
-            if not old_path.exists():
-                console.print(f"[yellow]File not found on disk: {old_path}[/yellow]")
-                if not click.confirm("Update registry name anyway?", default=False):
-                    return
-                new_path = old_path.with_stem(new_name)
-            else:
-                new_path = old_path.with_stem(new_name)
-                if new_path.exists():
-                    console.print(f"[red]A file already exists at {new_path} — aborting.[/red]")
-                    return
-                old_path.rename(new_path)
-                console.print(f"[green]✓ Renamed file: {old_path.name} → {new_path.name}[/green]")
-
-            conn.execute(
-                "UPDATE models SET display_name=?, file_path=?, last_updated=? WHERE id=?",
-                (new_name, str(new_path), now, row["id"]),
-            )
-
+            new_path = old_path.with_stem(new_name)
         else:
-            conn.execute(
-                "UPDATE models SET display_name=?, last_updated=? WHERE id=?",
-                (new_name, now, row["id"]),
-            )
+            new_path = old_path.with_stem(new_name)
+            if new_path.exists():
+                console.print(f"[red]A file already exists at {new_path} — aborting.[/red]")
+                return
+            old_path.rename(new_path)
+            console.print(f"[green]✓ Renamed file: {old_path.name} → {new_path.name}[/green]")
+
+        conn.execute(
+            "UPDATE models SET file_path=?, last_updated=? WHERE id=?",
+            (str(new_path), now, row["id"]),
+        )
 
         conn.execute(
             "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "rename", now, f"{old_display} → {new_name}"),
+            (row["id"], "rename_dir", now, f"{old_path.name} → {new_path.name}"),
         )
         conn.commit()
-        console.print(f"[green]✓ Registry updated: '{old_display}' → '{new_name}'[/green]")
+        console.print(f"[green]✓ File path updated in registry[/green]")
     finally:
         conn.close()
 
@@ -1935,6 +1994,34 @@ def delete(model):
         )
         conn.commit()
         console.print("[green]✓ Registry updated (status=deleted).[/green]")
+    finally:
+        conn.close()
+
+
+# ─── remove ───────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("model")
+def remove(model):
+    """Remove a model from the registry (soft delete). Keeps DB record, sets status=deleted."""
+    config = load_config()
+    conn = get_db(config)
+    row = find_model(conn, model)
+    now = now_iso()
+    try:
+        if not click.confirm(f"Remove '{row['display_name']}' from registry?", default=False):
+            return
+
+        conn.execute(
+            "UPDATE models SET status='deleted', last_updated=? WHERE id=?",
+            (now, row["id"]),
+        )
+        conn.execute(
+            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+            (row["id"], "remove", now, None),
+        )
+        conn.commit()
+        console.print("[green]✓ Model removed from registry (status=deleted).[/green]")
     finally:
         conn.close()
 
