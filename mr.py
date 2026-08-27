@@ -21,7 +21,7 @@ from rich.table import Table
 
 console = Console()
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
@@ -249,15 +249,7 @@ def parse_variant_from_filename(filename):
     return None
 
 
-def flatten_hf_subdir(directory):
-    """If directory contains exactly one subdirectory, move its contents up and remove the subdir."""
-    subdirs = [d for d in directory.iterdir() if d.is_dir()]
-    if len(subdirs) == 1:
-        subdir = subdirs[0]
-        console.print(f"  [dim]Flattening: {subdir.name}[/dim]")
-        for item in subdir.iterdir():
-            item.rename(directory / item.name)
-        subdir.rmdir()
+
 
 
 def parse_context_window_from_gguf(file_path):
@@ -1602,20 +1594,31 @@ def pull(ref, variant, backend, file_pattern, subdir):
         console.print(f"Downloading {len(files_to_download)} file(s) to [bold]{target_dir}[/bold]...")
         downloaded_paths = []
         for gguf_file in files_to_download:
-            local_path = Path(
-                hf_hub_download(
-                    repo_id=repo_id,
-                    filename=gguf_file,
-                    local_dir=str(target_dir),
-                    token=token,
-                )
+            # Ensure the target for download is the flattened target_dir
+            # hf_hub_download will create subdirs if filename has path components.
+            # We want to force it to download directly to target_dir.
+            # So, we pass only the basename of the file, and then move if necessary.
+            downloaded_file_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=gguf_file,
+                local_dir=str(target_dir),
+                token=token,
             )
+            local_path = Path(downloaded_file_path)
+            
+            # If the downloaded file is not directly in target_dir (i.e., hf_hub_download created a subdir),
+            # move it to target_dir.
+            if local_path.parent != target_dir:
+                final_path = target_dir / local_path.name
+                local_path.rename(final_path)
+                local_path = final_path
+                console.print(f"  Flattened {gguf_file} to: {local_path}")
+            else:
+                console.print(f"  Downloaded: {gguf_file}")
+            
             downloaded_paths.append(str(local_path))
-            console.print(f"  Downloaded: {gguf_file}")
 
-        # Flatten any nested subdirectories created by HuggingFace
-        if target_dir.exists():
-            flatten_hf_subdir(target_dir)
+
 
         # Calculate total size of all downloaded files
         total_size = sum(Path(p).stat().st_size for p in downloaded_paths)
