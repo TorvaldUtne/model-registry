@@ -1,4 +1,4 @@
-# mr — Model Registry
+# mr — Model Registry v1.1.0
 
 A single-file CLI for tracking, rating, and managing AI models across three local backends: **Ollama** (via Docker), **llama.cpp** (`.gguf` files), and **ComfyUI** (`.safetensors`, `.ckpt`, etc.). State is stored in a local SQLite database.
 
@@ -11,6 +11,9 @@ A single-file CLI for tracking, rating, and managing AI models across three loca
 - Blacklist models with a reason so you're warned before accidentally re-downloading them
 - Cross-backend duplicate detection (same `hf_repo` on multiple backends)
 - Audit log: every mutating operation is recorded in an `events` table
+- Model tagging system for custom categorization
+- Copy models between backends
+- Automatic directory flattening for HuggingFace downloads
 
 ## Requirements
 
@@ -134,12 +137,18 @@ export CIVITAI_API_KEY=...      # CivitAI (required for gated models)
 | `note MODEL [TEXT]` | Append a timestamped note. |
 | `touch MODEL` | Mark `last_used = now` (for tracking use outside this tool). |
 | `report` | Summary: totals by backend/status, unrated list, blacklisted list, cross-backend duplicates. |
-| `pull REF` | Download a model and register it. See below. |
-| `rename MODEL NEW_NAME` | Rename a model file on disk and update the registry entry. |
+| `pull REF [VARIANT]` | Download a model and register it. See below. |
+| `rename MODEL NEW_NAME` | Rename the directory containing a model on disk and update the registry entry. File name remains unchanged. |
 | `delete MODEL` | Remove a model from Ollama or disk; DB record is kept with `status=deleted`. |
+| `remove MODEL` | Hard delete a model from the registry (completely removes DB entry). |
+| `removeall` | Remove all models with status='deleted' from the registry. |
+| `tag MODEL TAGS...` | Add one or more tags to a model. |
+| `untag MODEL [TAGS...]` | Remove specific tags or all tags if none provided. |
+| `backends` | List configured backend names with their status. |
+| `copy SRC_BACKEND DST_BACKEND MODEL_NAME` | Copy a model from one backend to another. |
 | `blacklist MODEL [REASON]` | Blacklist and auto-delete a model. Future pulls warn before proceeding. |
 | `enrich` | Fetch HuggingFace and CivitAI metadata for all registered models. |
-| `search TERM` | Search registry by name, HF repo, or notes. |
+| `search TERM` | Search registry by name, HF repo, notes, or tags. |
 
 ### `list` options
 
@@ -148,6 +157,7 @@ export CIVITAI_API_KEY=...      # CivitAI (required for gated models)
 --status    active | unrated | blacklisted | deleted | on_hold | testing | keep | favorite
 --unrated   Show only models with no rating
 --all       Include non-local and blacklisted models
+--deleted   Show only deleted models
 ```
 
 ### `pull` reference formats
@@ -160,6 +170,7 @@ Backend is auto-detected from the ref format:
 | `org/repo` (HF) | `bartowski/Llama-3.2-3B-GGUF` | llamacpp |
 | `.gguf` filename | `model.Q4_K_M.gguf` | llamacpp |
 | `hf.co/org/repo:tag` | `hf.co/bartowski/Llama-3.2-3B-GGUF:Q4_K_M` | ollama |
+| `org/repo VARIANT` (new) | `mradermacher/RolePlayer-V6-LLaMa-70B-GGUF Q5_K_M` | llamacpp |
 | HF resolve URL | `https://huggingface.co/org/repo/resolve/main/file.safetensors` | comfyui |
 | AIR tag | `urn:air:sdxl:checkpoint:civitai:1234@5678` | comfyui |
 | CivitAI version ID | `civitai:12345` | comfyui |
@@ -186,17 +197,58 @@ python mr.py pull bartowski/Llama-3.2-3B-Instruct-GGUF --file "*Q4_K_M*"
 | `testing` | Under evaluation |
 | `on_hold` | Paused — may reconsider later |
 | `blacklisted` | Do not use; warns on future pull attempts |
-| `deleted` | Removed from disk; DB record retained |
+| `deleted` | Removed from disk; DB record retained (or removed entirely with `mr remove`) |
 
 ## Database
 
 The SQLite database (`registry.db`) has two tables:
 
-- **`models`** — one row per model with all metadata (rating, status, size, source URL, HF stats, CivitAI trigger words, etc.)
+- **`models`** — one row per model with all metadata (rating, status, size, source URL, HF stats, CivitAI trigger words, tags, etc.)
 - **`events`** — append-only audit log of every mutating operation
 
 The schema migrates automatically when new columns are added, so existing databases are never broken by upgrades.
 
+## Tags
+
+Models can be tagged with custom categories:
+
+```bash
+python mr.py tag gembrain RP General Coding Uncensored
+python mr.py untag gembrain uncensored
+```
+
+Tags appear in `mr list` and `mr show` output, and can be searched:
+
+```bash
+python mr.py search RP
+```
+
+## Version
+
+Run `mr` without arguments to see the current version:
+
+```bash
+$ mr
+Model Registry v1.1.0
+Run mr --help for available commands.
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Changelog
+
+### v1.1.0
+- Added `mr tag` and `mr untag` commands for model categorization
+- Added `mr copy` command to duplicate models between backends
+- Added `mr remove` and `mr removeall` for hard deletion
+- Added `mr backends` to list configured backends
+- Fixed `mr rename` to only rename directories, not files
+- Fixed HuggingFace downloads to flatten nested subdirectories
+- Added new download syntax: `mr pull org/repo variant` (instead of `org/repo:variant`)
+- Added `--deleted` flag to `mr list` to show deleted models
+- Added `--deleted` flag to `mr search` to include tags in search
+
+### v1.0.0
+- Initial release with scan, rate, pull, blacklist, enrich, and other commands
