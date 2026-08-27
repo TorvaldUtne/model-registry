@@ -1008,6 +1008,7 @@ def list_models(backend, status, unrated, show_all, deleted):
     """List models in the registry. By default shows only locally installed, non-blacklisted models."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
 
     query = "SELECT * FROM models WHERE 1=1"
     params = []
@@ -1100,6 +1101,7 @@ def show(model):
     """Show full details for a model."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     row = find_model(conn, model)
 
     tags = []
@@ -1129,8 +1131,9 @@ def show(model):
     if row["file_path"]:
         lines.append(f"[bold]File:[/bold]       {row['file_path']}")
     lines.append(f"[bold]Size:[/bold]       {row['size_gb']:.2f} GB" if row["size_gb"] is not None else "[bold]Size:[/bold]       -")
-    if row["context_window"]:
-        lines.append(f"[bold]Context:[/bold]    {row['context_window']:,} tokens")
+    context_window = row.get("context_window")
+    if context_window:
+        lines.append(f"[bold]Context:[/bold]    {context_window:,} tokens")
     lines.append(f"[bold]Local:[/bold]      {'yes' if row['currently_local'] else 'no'}")
     lines.append(f"[bold]Downloads:[/bold]  {row['times_downloaded']}")
     if tags:
@@ -1199,6 +1202,7 @@ def rate(model):
     """Interactively rate a model (1-5), set status, add optional note."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     row = find_model(conn, model)
     now = now_iso()
 
@@ -1246,6 +1250,7 @@ def status(model, status):
     """Set a model's status without requiring a rating."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     row = find_model(conn, model)
     now = now_iso()
 
@@ -1271,6 +1276,7 @@ def note(model, text):
     """Append a timestamped note to a model."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     row = find_model(conn, model)
     now = now_iso()
 
@@ -1300,6 +1306,7 @@ def touch(model):
     """Update last_used to now (use when you ran a model outside this tool)."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     row = find_model(conn, model)
     now = now_iso()
 
@@ -1323,6 +1330,7 @@ def report():
     """Summary: total models, GB by backend, unrated list, blacklisted list, cross-backend duplicates."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
 
     total = _scalar(conn, "SELECT COUNT(*) FROM models")
     total_gb = _scalar(conn, "SELECT COALESCE(SUM(size_gb), 0) FROM models WHERE currently_local=1")
@@ -1968,6 +1976,7 @@ def tag(model, tags):
     """Add tags to a model. Multiple tags can be provided."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     row = find_model(conn, model)
     now = now_iso()
     try:
@@ -2006,6 +2015,7 @@ def untag(model, tags):
     """Remove tags from a model. If no tags provided, removes all tags."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     row = find_model(conn, model)
     now = now_iso()
     try:
@@ -2154,6 +2164,7 @@ def copy(src_backend, dst_backend, model_name):
     """
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     now = now_iso()
     
     try:
@@ -2260,6 +2271,7 @@ def rename(model, new_name):
     """
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     row = find_model(conn, model)
     now = now_iso()
     try:
@@ -2310,6 +2322,7 @@ def delete(model):
     """Delete a model from Ollama or disk. Keeps DB record, sets status=deleted."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     row = find_model(conn, model)
     now = now_iso()
     try:
@@ -2358,6 +2371,7 @@ def remove(model):
     """Remove a model from the registry (hard delete). Completely removes the DB entry."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     row = find_model(conn, model)
     now = now_iso()
     try:
@@ -2386,6 +2400,7 @@ def blacklist(model, reason):
     """
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     init_db(conn)
     now = now_iso()
 
@@ -2483,6 +2498,7 @@ def enrich():
 
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
     now = now_iso()
 
     token_env = config["huggingface"]["token_env_var"]
@@ -2666,6 +2682,7 @@ def search(term):
     """Search local registry by name, hf_repo, notes, or tags."""
     config = load_config()
     conn = get_db(config)
+    init_db(conn)
 
     rows = conn.execute(
         """SELECT * FROM models
