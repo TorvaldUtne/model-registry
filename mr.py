@@ -89,7 +89,8 @@ def init_db(conn):
             hf_last_modified  TEXT,
             source_url        TEXT,
             base_model        TEXT,
-            trigger_words     TEXT
+            trigger_words     TEXT,
+            context_window    INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -107,6 +108,7 @@ def init_db(conn):
         ("source_url",    "TEXT"),
         ("base_model",    "TEXT"),
         ("trigger_words", "TEXT"),
+        ("context_window", "INTEGER"),
     ]:
         try:
             conn.execute(f"ALTER TABLE models ADD COLUMN {col} {definition}")
@@ -256,6 +258,117 @@ def flatten_hf_subdir(directory):
         for item in subdir.iterdir():
             item.rename(directory / item.name)
         subdir.rmdir()
+
+
+def parse_context_window_from_gguf(file_path):
+    """Extract context window from GGUF file metadata."""
+    try:
+        import struct
+    except ImportError:
+        return None
+    
+    try:
+        with open(file_path, "rb") as f:
+            # Read GGUF magic number
+            magic = f.read(4)
+            if magic != b"GGUF":
+                return None
+            
+            # Read GGUF version
+            version = struct.unpack("<I", f.read(4))[0]
+            
+            # Read number of tensor and metadata entries
+            if version >= 3:
+                f.read(8)  # skip reserved bytes
+            
+            # Read metadata key-value pairs
+            metadata = {}
+            while True:
+                if version >= 3:
+                    key_type = struct.unpack("<I", f.read(4))[0]
+                else:
+                    key_type = struct.unpack("<I", f.read(4))[0]
+                
+                if key_type == 0:  # GFU_KEY_END
+                    break
+                
+                # Read key
+                if version >= 3:
+                    key_len = struct.unpack("<Q", f.read(8))[0]
+                else:
+                    key_len = struct.unpack("<I", f.read(4))[0]
+                
+                key = f.read(key_len).decode("utf-8")
+                
+                # Read value type
+                if version >= 3:
+                    val_type = struct.unpack("<I", f.read(4))[0]
+                else:
+                    val_type = struct.unpack("<I", f.read(4))[0]
+                
+                # Read value based on type
+                if val_type == 0:  # UINT8
+                    value = struct.unpack("<B", f.read(1))[0]
+                elif val_type == 1:  # INT8
+                    value = struct.unpack("<b", f.read(1))[0]
+                elif val_type == 2:  # UINT16
+                    value = struct.unpack("<H", f.read(2))[0]
+                elif val_type == 3:  # INT16
+                    value = struct.unpack("<h", f.read(2))[0]
+                elif val_type == 4:  # UINT32
+                    value = struct.unpack("<I", f.read(4))[0]
+                elif val_type == 5:  # INT32
+                    value = struct.unpack("<i", f.read(4))[0]
+                elif val_type == 6:  # FLOAT32
+                    value = struct.unpack("<f", f.read(4))[0]
+                elif val_type == 7:  # BOOL
+                    value = struct.unpack("<B", f.read(1))[0] == 1
+                elif val_type == 8:  # STRING
+                    if version >= 3:
+                        str_len = struct.unpack("<Q", f.read(8))[0]
+                    else:
+                        str_len = struct.unpack("<I", f.read(4))[0]
+                    value = f.read(str_len).decode("utf-8")
+                elif val_type == 9:  # ARRAY
+                    # Skip arrays for now
+                    array_type = struct.unpack("<I", f.read(4))[0]
+                    if version >= 3:
+                        array_len = struct.unpack("<Q", f.read(8))[0]
+                    else:
+                        array_len = struct.unpack("<I", f.read(4))[0]
+                    # Skip array data
+                    for _ in range(array_len):
+                        if array_type == 8:  # STRING array
+                            if version >= 3:
+                                str_len = struct.unpack("<Q", f.read(8))[0]
+                            else:
+                                str_len = struct.unpack("<I", f.read(4))[0]
+                            f.read(str_len)
+                        else:
+                            # Skip primitive types
+                            sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1}
+                            f.read(sizes.get(array_type, 0))
+                else:
+                    break
+                
+                metadata[key] = value
+            
+            # Look for context window
+            context_keys = [
+                "llama.context_length",
+                "context_length",
+                "llama.context_length_train",
+                "rope.freq_base"
+            ]
+            for key in context_keys:
+                if key in metadata:
+                    value = metadata[key]
+                    if isinstance(value, int):
+                        return value
+            
+            return None
+    except Exception:
+        return None
 
 
 # ─── CivitAI / AIR helpers ───────────────────────────────────────────────────
@@ -832,12 +945,13 @@ def scan():
                 updated += 1
             else:
                 display_name = f.stem
+                context_window = parse_context_window_from_gguf(fpath)
                 conn.execute(
                     """INSERT INTO models
                        (display_name, variant, backend, source_type,
-                        file_path, size_gb, currently_local, first_seen, last_updated)
-                       VALUES (?,?,?,?,?,?,1,?,?)""",
-                    (display_name, variant, bname, bname, fpath, size_gb, now, now),
+                        file_path, size_gb, context_window, currently_local, first_seen, last_updated)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (display_name, variant, bname, bname, fpath, size_gb, context_window, now, now),
                 )
                 mid = _last_id(conn)
                 conn.execute(
@@ -1015,6 +1129,8 @@ def show(model):
     if row["file_path"]:
         lines.append(f"[bold]File:[/bold]       {row['file_path']}")
     lines.append(f"[bold]Size:[/bold]       {row['size_gb']:.2f} GB" if row["size_gb"] is not None else "[bold]Size:[/bold]       -")
+    if row["context_window"]:
+        lines.append(f"[bold]Context:[/bold]    {row['context_window']:,} tokens")
     lines.append(f"[bold]Local:[/bold]      {'yes' if row['currently_local'] else 'no'}")
     lines.append(f"[bold]Downloads:[/bold]  {row['times_downloaded']}")
     if tags:
@@ -1498,6 +1614,7 @@ def pull(ref, variant, backend, file_pattern, subdir):
         main_file = max(downloaded_paths, key=lambda p: Path(p).stat().st_size)
         main_path = Path(main_file)
         variant = parse_variant_from_filename(main_path.name)
+        context_window = parse_context_window_from_gguf(main_path)
 
         # Check if this subdirectory model already exists (by any file in it)
         existing_by_dir = None
@@ -2447,6 +2564,21 @@ def enrich():
                         (param_count, architecture, hf_downloads,
                          hf_likes, hf_last_modified, now, row["id"]),
                     )
+
+                    # Try to extract context window from local GGUF file if available
+                    local_rows = conn.execute(
+                        "SELECT id, file_path, backend FROM models WHERE hf_repo=? AND backend IN ('llamacpp', 'llamaserver')",
+                        (row["hf_repo"],)
+                    ).fetchall()
+                    for local_row in local_rows:
+                        if local_row["file_path"]:
+                            context_window = parse_context_window_from_gguf(local_row["file_path"])
+                            if context_window:
+                                conn.execute(
+                                    "UPDATE models SET context_window=? WHERE id=?",
+                                    (context_window, local_row["id"])
+                                )
+                                console.print(f"  [dim]Context window: {context_window} tokens[/dim]")
                     conn.execute(
                         "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
                         (row["id"], "enrich", now, json.dumps({"hf_downloads": hf_downloads})),
