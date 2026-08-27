@@ -241,82 +241,98 @@ def parse_ollama_list_lines(lines):
     return models
 
 def get_hf_metadata(hf_repo, hf_token):
-    \"\"\"Fetch metadata (param_count, architecture, downloads, likes, last_modified) from HuggingFace model card.\"\"\"
+    """Fetch metadata (param_count, architecture, downloads, likes, last_modified) from HuggingFace model card."""
     if not hf_repo:
         return {}
     try:
         from huggingface_hub import HfApi
         hf_api = HfApi(token=hf_token)
-        model_info = hf_api.get_model_info(hf_repo)
+        model_info = hf_api.model_info(repo_id=hf_repo)
 
         metadata = {}
         # Param count: usually in model_info.cardData.model_parameters or similar
         # This is often not directly available or in a consistent format from get_model_info
-        # For now, we\'ll try common keys. More robust parsing might involve downloading
+        # For now, we'll try common keys. More robust parsing might involve downloading
         # the model card and parsing it.
-        if hasattr(model_info, \'safetensors\') and model_info.safetensors and isinstance(model_info.safetensors, dict):
+        if hasattr(model_info, 'safetensors') and model_info.safetensors and isinstance(model_info.safetensors, dict):
             # Try to get param_count from safetensors metadata
-            for key in [\"total_params\", \"num_params\"]:\
-                if key in model_info.safetensors:\
-                    metadata[\"param_count\"] = model_info.safetensors[key]
+            for key in ["total_params", "num_params"]:
+                if key in model_info.safetensors:
+                    metadata["param_count"] = model_info.safetensors[key]
                     break
-        
+
         # Architecture
-        if hasattr(model_info, \'cardData\') and model_info.cardData and isinstance(model_info.cardData, dict):\
-            if \"architectures\" in model_info.cardData and isinstance(model_info.cardData[\"architectures\"], list) and model_info.cardData[\"architectures\"]:\
-                metadata[\"architecture\"] = model_info.cardData[\"architectures\"][0]
-            elif \"model_name\" in model_info.cardData: # sometimes architecture is part of name
-                name_lower = model_info.cardData[\"model_name\"].lower()
-                if \"llama\" in name_lower:
-                    metadata[\"architecture\"] = \"Llama\"
-                elif \"mistral\" in name_lower:
-                    metadata[\"architecture\"] = \"Mistral\"
+        if hasattr(model_info, 'cardData') and model_info.cardData and isinstance(model_info.cardData, dict):
+            if "architectures" in model_info.cardData and isinstance(model_info.cardData["architectures"], list) and model_info.cardData["architectures"]:
+                metadata["architecture"] = model_info.cardData["architectures"][0]
+            elif "model_name" in model_info.cardData: # sometimes architecture is part of name
+                name_lower = model_info.cardData["model_name"].lower()
+                if "llama" in name_lower:
+                    metadata["architecture"] = "Llama"
+                elif "mistral" in name_lower:
+                    metadata["architecture"] = "Mistral"
 
         # Downloads and Likes
-        metadata[\"hf_downloads\"] = model_info.downloads
-        metadata[\"hf_likes\"] = model_info.likes
-        
+        metadata["hf_downloads"] = model_info.downloads
+        metadata["hf_likes"] = model_info.likes
+
         # Last modified
-        metadata[\"hf_last_modified\"] = model_info.lastModified
+        metadata["hf_last_modified"] = model_info.lastModified
 
         return metadata
 
-    except Exception as e:
-        console.print(f\"[yellow]  Warning: Could not fetch HF metadata for {hf_repo}: {e}[/yellow]\")
+    except (AttributeError, requests.exceptions.RequestException, json.JSONDecodeError) as e:
+        console.print(f"[yellow]  Warning: Could not fetch HF metadata for {hf_repo}: {e}[/yellow]")
         return {}
 
-def get_hf_context_window(hf_repo, hf_token):\
-    \"\"\"Fetch context window from HuggingFace model config.\"\"\"\
-    if not hf_repo:\
+def get_hf_context_window(hf_repo, hf_token):
+    """Fetch context window from HuggingFace model config."""
+    if not hf_repo:
         return None
-    try:\
-        # We don\'t want to introduce a heavy dependency like `transformers`\
-        # so we manually download and parse config.json\
-        from huggingface_hub import hf_hub_download
+    try:
+        from huggingface_hub import hf_hub_download, HfHub
         import json
         import requests
 
-        # Try to download config.json
-        config_path = hf_hub_download(repo_id=hf_repo, filename=\"config.json\", token=hf_token)
-        with open(config_path, \"r\") as f:
-            config = json.load(f)
+        from huggingface_hub.utils import HfHubHTTPError
+        
+        def _get_context_from_config(repo, token):
+            try:
+                config_path = hf_hub_download(repo_id=repo, filename="config.json", token=token)
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                for key in ["max_position_embeddings", "max_sequence_length", "n_ctx", "seq_length", "max_seq_len", "sliding_window", "context_length"]:# noqa: E501
+                    if key in config and isinstance(config[key], int):
+                        return config[key]
+            except HfHubHTTPError as e:
+                if e.response.status_code == 404:
+                    return None # config.json not found
+                raise
+            except Exception:
+                raise
 
-        # Common keys for context window
-        context_keys = [
-            \"max_position_embeddings\",
-            \"max_sequence_length\",
-            \"n_ctx\",
-            \"seq_length\",
-            \"max_seq_len\",
-            \"sliding_window\",
-            \"context_length\",
-        ]
-        for key in context_keys:
-            if key in config and isinstance(config[key], int):
-                return config[key]
+        # Try the given hf_repo first
+        try:
+            ctx = _get_context_from_config(hf_repo, hf_token)
+            if ctx is not None:
+                return ctx
+        except Exception:
+            pass # Continue to try base repo
+
+        # If not found, try stripping the last path segment (e.g., bartowski/Ling-3.0-tiny-GGUF -> inclusionAI/Ling-3.0-tiny)
+        parts = hf_repo.split('/')
+        if len(parts) > 2: # e.g. "org/repo/subrepo"
+            base_repo = "/".join(parts[:-1])
+            try:
+                ctx = _get_context_from_config(base_repo, hf_token)
+                if ctx is not None:
+                    return ctx
+            except Exception:
+                pass # Couldn't find in base repo either
+
         return None
     except Exception as e:
-        console.print(f\"[yellow]  Warning: Could not fetch HF context window for {hf_repo}: {e}[/yellow]\")
+        console.print(f"[yellow]  Warning: Could not fetch HF context window for {hf_repo}: {e}[/yellow]")
         return None
 
 
@@ -339,21 +355,21 @@ def parse_context_window_from_gguf(file_path):
         import struct
     except ImportError:
         return None
-    
+
     try:
         with open(file_path, "rb") as f:
             # Read GGUF magic number
             magic = f.read(4)
             if magic != b"GGUF":
                 return None
-            
+
             # Read GGUF version
             version = struct.unpack("<I", f.read(4))[0]
-            
+
             # Read number of tensor and metadata entries
             if version >= 3:
                 f.read(8)  # skip reserved bytes
-            
+
             # Read metadata key-value pairs
             metadata = {}
             while True:
@@ -361,24 +377,24 @@ def parse_context_window_from_gguf(file_path):
                     key_type = struct.unpack("<I", f.read(4))[0]
                 else:
                     key_type = struct.unpack("<I", f.read(4))[0]
-                
+
                 if key_type == 0:  # GFU_KEY_END
                     break
-                
+
                 # Read key
                 if version >= 3:
                     key_len = struct.unpack("<Q", f.read(8))[0]
                 else:
                     key_len = struct.unpack("<I", f.read(4))[0]
-                
+
                 key = f.read(key_len).decode("utf-8")
-                
+
                 # Read value type
                 if version >= 3:
                     val_type = struct.unpack("<I", f.read(4))[0]
                 else:
                     val_type = struct.unpack("<I", f.read(4))[0]
-                
+
                 # Read value based on type
                 if val_type == 0:  # UINT8
                     value = struct.unpack("<B", f.read(1))[0]
@@ -423,9 +439,9 @@ def parse_context_window_from_gguf(file_path):
                             f.read(sizes.get(array_type, 0))
                 else:
                     break
-                
+
                 metadata[key] = value
-            
+
             # Look for context window
             context_keys = [
                 "llama.context_length",
@@ -438,7 +454,7 @@ def parse_context_window_from_gguf(file_path):
                     value = metadata[key]
                     if isinstance(value, int):
                         return value
-            
+
             return None
     except Exception as e:
         console.print(f"[yellow]  Warning: Could not parse GGUF context window from {file_path}: {e}[/yellow]")
@@ -883,19 +899,19 @@ def scan():
                     update_fields = {"size_gb": size_gb, "currently_local": 1, "last_updated": now, "ollama_name": oname}
                     if context_window is not None:
                         update_fields["context_window"] = context_window
-                    
+
                     set_clauses = [f"{k}=?" for k in update_fields.keys()]
                     params = list(update_fields.values()) + [existing["id"]]
-                    
+
                     conn.execute(
                         f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
                         params,
                     )
-                    
+
                     event_detail = {"size_gb": size_gb, "ollama_name": oname}
                     if context_window is not None:
                         event_detail["context_window"] = context_window
-                    
+
                     conn.execute(
                         "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
                         (existing["id"], "scan_updated", now, json.dumps(event_detail)),
@@ -989,19 +1005,19 @@ def scan():
                 update_fields = {"size_gb": size_gb, "currently_local": 1, "last_updated": now, "variant": variant}
                 if context_window is not None:
                     update_fields["context_window"] = context_window
-                
+
                 set_clauses = [f"{k}=?" for k in update_fields.keys()]
                 params = list(update_fields.values()) + [existing["id"]]
-                
+
                 conn.execute(
                     f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
                     params,
                 )
-                
+
                 event_detail = {"size_gb": size_gb, "variant": variant}
                 if context_window is not None:
                     event_detail["context_window"] = context_window
-                
+
                 conn.execute(
                     "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
                     (existing["id"], "scan_updated", now, json.dumps(event_detail)),
@@ -1090,6 +1106,70 @@ def scan():
         f"\n[green]Scan complete.[/green] "
         f"Added: [bold]{added}[/bold]  Updated: [bold]{updated}[/bold]"
     )
+
+
+# ─── enrich ───────────────────────────────────────────────────────────────────
+
+@cli.command()
+def enrich():
+    """Enrich model metadata from external sources (e.g. HuggingFace)."""
+    config = load_config()
+    conn = get_db(config)
+    init_db(conn)
+    now = now_iso()
+    hf_token = os.environ.get(config.get("huggingface", {}).get("token_env_var"))
+    updated_count = 0
+
+    models = conn.execute("SELECT * FROM models WHERE hf_repo IS NOT NULL").fetchall()
+    if not models:
+        console.print("No models with hf_repo found to enrich.")
+        return
+
+    console.print(f"Enriching {len(models)} models from HuggingFace...")
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>1.0f}%"),
+        console=console,
+    )
+
+    with progress:
+        task = progress.add_task("[cyan]Enriching models...", total=len(models))
+        for row in models:
+            progress.update(task, description=f"[cyan]Enriching {row['display_name']}...")
+            changes = {}
+            # Fetch HF metadata
+            hf_metadata = get_hf_metadata(row["hf_repo"], hf_token)
+            if hf_metadata:
+                for k in ["param_count", "architecture", "hf_downloads", "hf_likes", "hf_last_modified"]:
+                    if k in hf_metadata and hf_metadata[k] != row[k]:
+                        changes[k] = hf_metadata[k]
+
+            # Fetch HF context window
+            context_window = get_hf_context_window(row["hf_repo"], hf_token)
+            if context_window is not None and context_window != row["context_window"]:
+                changes["context_window"] = context_window
+
+            if changes:
+                set_clauses = [f"{k}=?" for k in changes.keys()]
+                params = list(changes.values()) + [now, row["id"]]
+                conn.execute(
+                    f"UPDATE models SET {', '.join(set_clauses)}, last_updated=? WHERE id=?",
+                    params,
+                )
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (row["id"], "enrich_updated", now, json.dumps(changes)),
+                )
+                updated_count += 1
+            progress.advance(task)
+
+    conn.commit()
+    conn.close()
+    console.print(f"\n[green]Enrichment complete.[/green] Updated: [bold]{updated_count}[/bold]")
 
 
 # ─── list ─────────────────────────────────────────────────────────────────────
@@ -1517,75 +1597,30 @@ def report():
 
 # ─── enrich ───────────────────────────────────────────────────────────────────
 
-def get_hf_metadata(hf_repo, hf_token):
-    """Fetch metadata (param_count, architecture, downloads, likes, last_modified) from HuggingFace model card."""
-    if not hf_repo:
-        return {}
-    try:
-        from huggingface_hub import HfApi
-        hf_api = HfApi(token=hf_token)
-        model_info = hf_api.get_model_info(hf_repo)
-
-        metadata = {}
-        # Param count: usually in model_info.cardData.model_parameters or similar
-        # This is often not directly available or in a consistent format from get_model_info
-        # For now, we'll try common keys. More robust parsing might involve downloading
-        # the model card and parsing it.
-        if hasattr(model_info, 'safetensors') and model_info.safetensors and isinstance(model_info.safetensors, dict):
-            # Try to get param_count from safetensors metadata
-            for key in ["total_params", "num_params"]:
-                if key in model_info.safetensors:
-                    metadata["param_count"] = model_info.safetensors[key]
-                    break
-        
-        # Architecture
-        if hasattr(model_info, 'cardData') and model_info.cardData and isinstance(model_info.cardData, dict):
-            if "architectures" in model_info.cardData and isinstance(model_info.cardData["architectures"], list) and model_info.cardData["architectures"]:
-                metadata["architecture"] = model_info.cardData["architectures"][0]
-            elif "model_name" in model_info.cardData: # sometimes architecture is part of name
-                name_lower = model_info.cardData["model_name"].lower()
-                if "llama" in name_lower:
-                    metadata["architecture"] = "Llama"
-                elif "mistral" in name_lower:
-                    metadata["architecture"] = "Mistral"
-
-        # Downloads and Likes
-        metadata["hf_downloads"] = model_info.downloads
-        metadata["hf_likes"] = model_info.likes
-        
-        # Last modified
-        metadata["hf_last_modified"] = model_info.lastModified
-
-        return metadata
-
-    except Exception as e:
-        console.print(f"[yellow]  Warning: Could not fetch HF metadata for {hf_repo}: {e}[/yellow]")
-        return {}
-
 @cli.command()
-def enrich():
-    """Fetch additional metadata (e.g., context window, param count) from HuggingFace Hub for models with hf_repo.
-
-    Only enriches models that are currently local and have an hf_repo but are missing enrichment data.
-    """
+@click.option("--all", "enrich_all", is_flag=True, default=False, help="Enrich all models with hf_repo, not just local ones")
+def enrich(enrich_all):
+    """Fetch additional metadata (context window, parameters, architecture, stats) from HuggingFace Hub."""
     config = load_config()
     conn = get_db(config)
     init_db(conn)
     now = now_iso()
     hf_token = os.environ.get(config.get("huggingface", {}).get("token_env_var"))
 
-    # Select models that are local, have an hf_repo, and are missing context_window or other enrichment data
-    # (param_count, architecture, hf_downloads, hf_likes, hf_last_modified)
-    rows = conn.execute("""
-        SELECT id, hf_repo, backend, file_path, ollama_name
+    where_clause = "WHERE hf_repo IS NOT NULL AND hf_repo != ''"
+    if not enrich_all:
+        where_clause += " AND currently_local=1"
+
+    rows = conn.execute(f"""
+        SELECT id, display_name, hf_repo, backend, file_path, ollama_name,
+               context_window, param_count, architecture, hf_downloads, hf_likes, hf_last_modified
         FROM models
-        WHERE hf_repo IS NOT NULL AND currently_local=1
-          AND (context_window IS NULL OR param_count IS NULL OR architecture IS NULL OR hf_downloads IS NULL)
+        {where_clause}
         ORDER BY display_name
     """).fetchall()
 
     if not rows:
-        console.print("[green]No models needing enrichment found.[/green]")
+        console.print("[yellow]No models with hf_repo found to enrich.[/yellow]")
         conn.close()
         return
 
@@ -1601,28 +1636,29 @@ def enrich():
     ) as progress:
         task = progress.add_task("Enriching models", total=len(rows))
         for row in rows:
-            progress.update(task, description=f"Enriching [bold]{row['hf_repo']}[/bold]")
-            
+            progress.update(task, description=f"Enriching [bold]{row['display_name'][:40]}[/bold]")
             update_fields = {}
+
             # Context window
             if row["context_window"] is None:
-                context_window = get_hf_context_window(row["hf_repo"], hf_token)
-                if context_window is not None:
-                    update_fields["context_window"] = context_window
-            
-            # Other HF metadata
-            if row["param_count"] is None or row["architecture"] is None or row["hf_downloads"] is None:
-                metadata = get_hf_metadata(row["hf_repo"], hf_token)
-                if metadata:
-                    for k in ["param_count", "architecture", "hf_downloads", "hf_likes", "hf_last_modified"]:
-                        if k in metadata and row[k] is None: # Only update if not already set
-                            update_fields[k] = metadata[k]
+                ctx = get_hf_context_window(row["hf_repo"], hf_token)
+                if ctx is not None:
+                    update_fields["context_window"] = ctx
+
+            # Metadata from HF API
+            if any(row[k] is None for k in ("param_count", "architecture", "hf_downloads", "hf_likes", "hf_last_modified")):
+                meta = get_hf_metadata(row["hf_repo"], hf_token)
+                if meta:
+                    for k, v in meta.items():
+                        if v is not None and row[k] is None:
+                            update_fields[k] = v
 
             if update_fields:
+                update_fields["last_updated"] = now
                 set_clauses = [f"{k}=?" for k in update_fields.keys()]
-                params = list(update_fields.values()) + [now, row["id"]]
+                params = list(update_fields.values()) + [row["id"]]
                 conn.execute(
-                    f"UPDATE models SET {', '.join(set_clauses)}, last_updated=? WHERE id=?",
+                    f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
                     params,
                 )
                 conn.execute(
@@ -1630,1285 +1666,12 @@ def enrich():
                     (row["id"], "enrich_updated", now, json.dumps(update_fields)),
                 )
                 updated_count += 1
+
             progress.advance(task)
 
     conn.commit()
     conn.close()
-    console.print(f"\n[green]Enrichment complete.[/green] Updated: [bold]{updated_count}[/bold] model(s).")
-
-
-# ─── pull ─────────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("ref")
-@click.argument("variant", required=False)
-@click.option("--backend", type=str, default=None)
-@click.option("--file", "file_pattern", default=None, help="Glob pattern for file in HF repo")
-@click.option("--subdir", default=None, help="ComfyUI subdir to save into (e.g. checkpoints, loras)")
-def pull(ref, variant, backend, file_pattern, subdir):
-    """Pull a model. Warns if blacklisted or previously deleted.
-
-    For ComfyUI models, --subdir is required. Supports HuggingFace repos
-    (org/repo format) and CivitAI downloads (civitai:<versionId> or CivitAI URL).
-
-    For GGUF (llama.cpp) models, when multiple .gguf files exist, all files will
-    be downloaded to a subdirectory named after the repo. Use --file with a glob
-    pattern to download specific files instead.
-
-    NEW: For HF downloads with multiple GGUF files, you can specify the variant
-    as a second argument: mr pull org/repo Q5_K_M (instead of org/repo:Q5_K_M)
-    """
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    now = now_iso()
-
-    # Handle new syntax: if variant provided, construct ref as org/repo:variant
-    if variant and not re.search(r"(?:hf\.co|huggingface\.co)/", ref, re.IGNORECASE):
-        if "/" in ref:
-            ref = f"{ref}:{variant}"
-        elif backend in get_gguf_backend_names(config):
-            console.print(f"[red]For {backend}, ref must be 'org/repo' format when using variant argument.[/red]")
-            conn.close()
-            return
-
-    # Auto-detect backend
-    if backend is None:
-        if parse_civitai_version_id(ref) is not None:
-            backend = "comfyui"
-        elif ref.endswith(".gguf") or ("/" in ref and not re.search(r"(?:hf\.co|huggingface\.co)/", ref, re.IGNORECASE)):
-            backend = "llamacpp"
-        else:
-            backend = "ollama"
-
-    # Pre-pull: check if blacklisted or deleted
-    hf_repo, _ = parse_hf_repo_from_ollama(ref)
-    existing = None
-    if hf_repo:
-        existing = conn.execute(
-            "SELECT * FROM models WHERE hf_repo=?", (hf_repo,)
-        ).fetchone()
-    if not existing:
-        existing = conn.execute(
-            "SELECT * FROM models WHERE display_name LIKE ? OR ollama_name=?",
-            (f"%{ref}%", ref),
-        ).fetchone()
-
-    if existing:
-        if existing["status"] == "blacklisted":
-            console.print("[bold red]⚠ WARNING: This model is BLACKLISTED[/bold red]")
-            console.print(f"  Rating: {existing['rating']}/5" if existing["rating"] else "  Unrated")
-            if existing["notes"]:
-                for line in (existing["notes"] or "").strip().splitlines()[-3:]:
-                    console.print(f"  {line}")
-            if not click.confirm("Proceed anyway?", default=False):
-                conn.close()
-                return
-        elif existing["status"] == "deleted":
-            console.print("[yellow]⚠ This model was previously deleted.[/yellow]")
-            events = conn.execute(
-                "SELECT * FROM events WHERE model_id=? ORDER BY timestamp DESC LIMIT 5",
-                (existing["id"],),
-            ).fetchall()
-            for e in events:
-                console.print(f"  [dim]{e['timestamp']}[/dim]  {e['event_type']}  {e['detail'] or ''}")
-            if not click.confirm("Proceed anyway?", default=False):
-                conn.close()
-                return
-
-    # ── Ollama pull ──────────────────────────────────────────────────────────
-    if backend == "ollama":
-        container = config["backends"]["ollama"]["docker_container"]
-        console.print(f"Pulling [bold]{ref}[/bold] via Ollama...")
-        result = subprocess.run(
-            ["docker", "exec", container, "ollama", "pull", ref],
-            text=True,
-        )
-        if result.returncode != 0:
-            console.print("[red]Pull failed.[/red]")
-            conn.close()
-            return
-
-        hf_repo2, variant2 = parse_hf_repo_from_ollama(ref)
-        source_type = get_source_type(ref)
-
-        if existing:
-            conn.execute(
-                """UPDATE models
-                   SET currently_local=1, times_downloaded=times_downloaded+1,
-                       last_used=?, last_updated=?
-                   WHERE id=?""",
-                (now, now, existing["id"]),
-            )
-            mid = existing["id"]
-        else:
-            conn.execute(
-                """INSERT INTO models
-                   (display_name, hf_repo, variant, backend, source_type,
-                    ollama_name, currently_local, times_downloaded, first_seen, last_used, last_updated)
-                   VALUES (?,?,?,?,?,?,1,1,?,?,?)""",
-                (ref, hf_repo2, variant2, "ollama", source_type, ref, now, now, now),
-            )
-            mid = _last_id(conn)
-
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (mid, "pull", now, json.dumps({"ref": ref})),
-        )
-        conn.commit()
-        console.print("[green]✓ Pull complete. Registry updated.[/green]")
-
-    # ── GGUF file backends (llamacpp, llamaserver, etc.) ────────────────────
-    elif backend in get_gguf_backend_names(config):
-        try:
-            from huggingface_hub import hf_hub_download, list_repo_files
-        except ImportError:
-            console.print("[red]huggingface_hub not installed. Run: pip install huggingface_hub[/red]")
-            conn.close()
-            return
-
-        model_dir = Path(config["backends"][backend]["model_dir"])
-        token_env = config["huggingface"]["token_env_var"]
-        token = os.environ.get(token_env)
-
-        parsed_repo, parsed_variant = parse_hf_repo_from_ollama(ref)
-        repo_id = parsed_repo if parsed_repo else ref
-        if parsed_variant and not file_pattern:
-            file_pattern = f"*{parsed_variant}*.gguf"
-
-        if "/" not in repo_id:
-            console.print(f"[red]For {backend}, ref must be 'org/repo' or 'hf.co/org/repo:tag' format.[/red]")
-            conn.close()
-            return
-
-        all_files = list(list_repo_files(repo_id, token=token))
-        gguf_files = [f for f in all_files if f.endswith(".gguf")]
-
-        if not gguf_files:
-            console.print(f"[red]No .gguf files found in {repo_id}[/red]")
-            conn.close()
-            return
-
-        if file_pattern:
-            matches = [f for f in gguf_files if fnmatch.fnmatch(f, file_pattern)]
-            if not matches:
-                console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
-                conn.close()
-                return
-            files_to_download = matches
-        elif len(gguf_files) == 1:
-            files_to_download = gguf_files
-        else:
-            console.print(f"Multiple GGUF files in [bold]{repo_id}[/bold]:")
-            for i, f in enumerate(gguf_files, 1):
-                console.print(f"  {i}. {f}")
-            # For multiple files, ask if user wants all or specific pattern
-            if click.confirm("Download all GGUF files to a subdirectory?", default=True):
-                files_to_download = gguf_files
-            else:
-                file_pattern = click.prompt("Enter pattern (e.g., *Q4_K_M*)")
-                matches = [f for f in gguf_files if fnmatch.fnmatch(f, file_pattern)]
-                if not matches:
-                    console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
-                    conn.close()
-                    return
-                files_to_download = matches
-
-        # Create subdirectory for this model based on repo name
-        repo_name = repo_id.split("/")[1] if "/" in repo_id else repo_id
-        # Clean up repo name for use as directory name
-        repo_name = re.sub(r'[^a-zA-Z0-9_.-]', '-', repo_name)
-        target_dir = model_dir / repo_name
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        console.print(f"Downloading {len(files_to_download)} file(s) to [bold]{target_dir}[/bold]...")
-        downloaded_paths = []
-        for gguf_file in files_to_download:
-            # Ensure the target for download is the flattened target_dir
-            # hf_hub_download will create subdirs if filename has path components.
-            # We want to force it to download directly to target_dir.
-            # So, we pass only the basename of the file, and then move if necessary.
-            downloaded_file_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=gguf_file,
-                local_dir=str(target_dir),
-                token=token,
-            )
-            local_path = Path(downloaded_file_path)
-            
-            # If the downloaded file is not directly in target_dir (i.e., hf_hub_download created a subdir),
-            # move it to target_dir.
-            if local_path.parent != target_dir:
-                final_path = target_dir / local_path.name
-                local_path.rename(final_path)
-                local_path = final_path
-                console.print(f"  Flattened {gguf_file} to: {local_path}")
-            else:
-                console.print(f"  Downloaded: {gguf_file}")
-            
-            downloaded_paths.append(str(local_path))
-
-
-
-        # Calculate total size of all downloaded files
-        total_size = sum(Path(p).stat().st_size for p in downloaded_paths)
-        size_gb = round(total_size / (1024 ** 3), 2)
-
-        # Use the largest file for main path and name
-        main_file = max(downloaded_paths, key=lambda p: Path(p).stat().st_size)
-        main_path = Path(main_file)
-        variant = parse_variant_from_filename(main_path.name)
-        context_window = parse_context_window_from_gguf(main_path)
-
-        # Check if this subdirectory model already exists (by any file in it)
-        existing_by_dir = None
-        for p in downloaded_paths:
-            existing_by_dir = conn.execute(
-                "SELECT * FROM models WHERE file_path=?", (p,)
-            ).fetchone()
-            if existing_by_dir:
-                break
-
-        if existing_by_dir:
-            # Update existing model entry
-            conn.execute(
-                """UPDATE models
-                   SET currently_local=1, times_downloaded=times_downloaded+1,
-                       file_path=?, size_gb=?, last_used=?, last_updated=?, variant=?
-                   WHERE id=?""",
-                (main_file, size_gb, now, now, variant, existing_by_dir["id"]),
-            )
-            mid = existing_by_dir["id"]
-        else:
-            # Create new model entry with subdir as display_name
-            conn.execute(
-                """INSERT INTO models
-                   (display_name, hf_repo, variant, backend, source_type,
-                    file_path, size_gb, currently_local, times_downloaded,
-                    first_seen, last_used, last_updated)
-                   VALUES (?,?,?,?,?,?,?,1,1,?,?,?)""",
-                (repo_name, repo_id, variant, backend, backend,
-                 main_file, size_gb, now, now, now),
-            )
-            mid = _last_id(conn)
-
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (mid, "pull", now, json.dumps({"repo_id": repo_id, "files": files_to_download, "subdir": repo_name})),
-        )
-        conn.commit()
-        console.print(
-            f"[green]✓ Downloaded {len(files_to_download)} file(s) to {target_dir} ({size_gb:.2f} GB). Registry updated.[/green]"
-        )
-
-    # ── ComfyUI download (HuggingFace or CivitAI) ────────────────────────────
-    elif backend == "comfyui":
-        comfy_cfg = config["backends"].get("comfyui", {})
-        base_dir = Path(comfy_cfg.get("base_dir", ""))
-        if not base_dir.exists():
-            console.print(f"[red]ComfyUI base_dir does not exist: {base_dir}[/red]")
-            conn.close()
-            return
-
-        civitai_cfg = config.get("civitai", {})
-        token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
-        civitai_token = os.environ.get(token_env)
-
-        civitai_version_id = parse_civitai_version_id(ref)
-        _civitai_model_id = parse_civitai_model_id(ref)
-
-        # Browse URL with model ID but no version ID — resolve via API
-        if civitai_version_id is None and _civitai_model_id:
-            _dm = re.search(_CIVITAI_DOMAIN_RE, ref)
-            _host = _dm.group(0) if _dm else "civitai.com"
-            console.print(f"Fetching model info from CivitAI API (model {_civitai_model_id})...")
-            civitai_version_id, _api_subdir = fetch_civitai_model_info(
-                _civitai_model_id, token=civitai_token, host=_host
-            )
-            if civitai_version_id:
-                console.print(f"  Using latest version [bold]{civitai_version_id}[/bold]")
-            if not subdir and _api_subdir:
-                subdir = _api_subdir
-                console.print(f"  Auto-detected subdir [bold]{subdir}[/bold] from CivitAI model type")
-
-        if not subdir:
-            # Auto-detect from AIR tag type field
-            air = parse_air_tag(ref)
-            if air:
-                subdir = AIR_TYPE_TO_SUBDIR.get(air["type"])
-                if subdir:
-                    console.print(f"  Auto-detected subdir [bold]{subdir}[/bold] from AIR type '{air['type']}'")
-        if not subdir:
-            subdir = click.prompt("ComfyUI subdir (e.g. checkpoints, loras, vae)")
-
-        dest_dir = base_dir / subdir
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        if civitai_version_id:
-            # ── CivitAI download ─────────────────────────────────────────────
-            try:
-                import requests as _requests
-            except ImportError:
-                console.print("[red]requests not installed. Run: pip install requests[/red]")
-                conn.close()
-                return
-
-            # Token must be a query param — Authorization header is stripped on CDN redirect
-            _dm = re.search(_CIVITAI_DOMAIN_RE, ref)
-            _civitai_host = _dm.group(0) if _dm else "civitai.com"
-            download_url = f"https://{_civitai_host}/api/download/models/{civitai_version_id}"
-            params = {}
-            if civitai_token:
-                params["token"] = civitai_token
-            else:
-                console.print("[yellow]⚠ No CivitAI API key found. Download may fail for gated models.[/yellow]")
-
-            console.print(f"Downloading from CivitAI (version {civitai_version_id})...")
-            resp = _requests.get(download_url, params=params, stream=True, timeout=(30, None))
-            if resp.status_code == 401:
-                console.print(f"[red]CivitAI download failed: unauthorized. Check your {token_env} env var.[/red]")
-                conn.close()
-                return
-            if resp.status_code != 200:
-                console.print(f"[red]CivitAI download failed (HTTP {resp.status_code})[/red]")
-                conn.close()
-                return
-
-            # Get filename from Content-Disposition header
-            cd = resp.headers.get("Content-Disposition", "")
-            filename_match = re.search(r'filename="?([^";\r\n]+)"?', cd)
-            if filename_match:
-                filename = filename_match.group(1).strip()
-            else:
-                filename = click.prompt("Filename to save as (no path)")
-
-            local_path = dest_dir / filename
-            total = int(resp.headers.get("Content-Length", 0)) or None
-
-            try:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    TaskProgressColumn(),
-                    console=console,
-                ) as progress:
-                    task = progress.add_task(f"Downloading {filename}", total=total)
-                    with open(local_path, "wb") as fh:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            fh.write(chunk)
-                            progress.advance(task, len(chunk))
-            except Exception:
-                local_path.unlink(missing_ok=True)
-                raise
-
-            size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
-            fpath = str(local_path)
-
-            air = parse_air_tag(ref)
-            civitai_url = civitai_source_url(ref, civitai_version_id, air["model_id"] if air else None)
-
-            # Check if already in DB by file_path
-            existing_by_path = conn.execute(
-                "SELECT * FROM models WHERE file_path=?", (fpath,)
-            ).fetchone()
-            if existing_by_path or existing:
-                row_to_update = existing_by_path or existing
-                conn.execute(
-                    """UPDATE models
-                       SET currently_local=1, times_downloaded=times_downloaded+1,
-                           file_path=?, size_gb=?, last_used=?, last_updated=?,
-                           source_type='comfyui_civitai', source_url=?
-                       WHERE id=?""",
-                    (fpath, size_gb, now, now, civitai_url, row_to_update["id"]),
-                )
-                mid = row_to_update["id"]
-            else:
-                conn.execute(
-                    """INSERT INTO models
-                       (display_name, variant, backend, source_type, source_url,
-                        file_path, size_gb, currently_local, times_downloaded,
-                        first_seen, last_used, last_updated)
-                       VALUES (?,?,?,?,?,?,?,1,1,?,?,?)""",
-                    (local_path.stem, subdir, "comfyui", "comfyui_civitai", civitai_url,
-                     fpath, size_gb, now, now, now),
-                )
-                mid = _last_id(conn)
-
-            conn.execute(
-                "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                (mid, "pull", now, json.dumps({"civitai_version_id": civitai_version_id, "file": filename})),
-            )
-            conn.commit()
-            console.print(
-                f"[green]✓ Downloaded to {local_path} ({size_gb:.2f} GB). Registry updated.[/green]"
-            )
-
-        else:
-            # ── HuggingFace download to ComfyUI subdir ───────────────────────
-            try:
-                from huggingface_hub import hf_hub_download, list_repo_files
-            except ImportError:
-                console.print("[red]huggingface_hub not installed. Run: pip install huggingface_hub[/red]")
-                conn.close()
-                return
-
-            token_env = config["huggingface"]["token_env_var"]
-            token = os.environ.get(token_env)
-
-            # Detect full HF resolve URLs: https://huggingface.co/org/repo/resolve/ref/path/file
-            _hf_resolve = re.match(
-                r"https://huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.+)$",
-                ref, re.IGNORECASE,
-            )
-            if _hf_resolve:
-                repo_id     = _hf_resolve.group(1)
-                revision    = _hf_resolve.group(2)
-                chosen_file = _hf_resolve.group(3)
-                console.print(
-                    f"Downloading [bold]{chosen_file}[/bold] from {repo_id} @ {revision}..."
-                )
-            else:
-                repo_id  = ref
-                revision = None
-
-                if "/" not in repo_id:
-                    console.print("[red]For HuggingFace, ref must be 'org/repo' format or a full resolve URL.[/red]")
-                    conn.close()
-                    return
-
-                comfy_exts = tuple(comfy_cfg.get("extensions", [".safetensors", ".ckpt", ".pt", ".pth", ".bin"]))
-                all_files = list(list_repo_files(repo_id, token=token))
-                model_files = [f for f in all_files if f.lower().endswith(comfy_exts)]
-
-                if not model_files:
-                    console.print(f"[red]No model files found in {repo_id}[/red]")
-                    conn.close()
-                    return
-
-                if file_pattern:
-                    matches = [f for f in model_files if fnmatch.fnmatch(f, file_pattern)]
-                    if not matches:
-                        console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
-                        conn.close()
-                        return
-                    chosen_file = matches[0]
-                elif len(model_files) == 1:
-                    chosen_file = model_files[0]
-                else:
-                    console.print(f"Multiple model files in [bold]{repo_id}[/bold]:")
-                    for i, f in enumerate(model_files, 1):
-                        console.print(f"  {i}. {f}")
-                    idx = click.prompt("Pick a number", type=click.IntRange(1, len(model_files)))
-                    chosen_file = model_files[idx - 1]
-
-                console.print(f"Downloading [bold]{chosen_file}[/bold] from {repo_id}...")
-            _hf_kwargs = dict(repo_id=repo_id, filename=chosen_file,
-                              local_dir=str(dest_dir), token=token)
-            if revision:
-                _hf_kwargs["revision"] = revision
-            local_path = Path(hf_hub_download(**_hf_kwargs))
-
-            # Flatten any nested subdirectories created by HuggingFace
-            if dest_dir.exists():
-                flatten_hf_subdir(dest_dir)
-
-            size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
-            fpath = str(local_path)
-
-            existing_by_path = conn.execute(
-                "SELECT * FROM models WHERE file_path=?", (fpath,)
-            ).fetchone()
-            if existing_by_path or existing:
-                row_to_update = existing_by_path or existing
-                conn.execute(
-                    """UPDATE models
-                       SET currently_local=1, times_downloaded=times_downloaded+1,
-                           file_path=?, size_gb=?, hf_repo=?, last_used=?, last_updated=?,
-                           source_type='comfyui_hf'
-                       WHERE id=?""",
-                    (fpath, size_gb, repo_id, now, now, row_to_update["id"]),
-                )
-                mid = row_to_update["id"]
-            else:
-                conn.execute(
-                    """INSERT INTO models
-                       (display_name, hf_repo, variant, backend, source_type,
-                        file_path, size_gb, currently_local, times_downloaded,
-                        first_seen, last_used, last_updated)
-                       VALUES (?,?,?,?,?,?,?,1,1,?,?,?)""",
-                    (local_path.stem, repo_id, subdir, "comfyui", "comfyui_hf",
-                     fpath, size_gb, now, now, now),
-                )
-                mid = _last_id(conn)
-
-            conn.execute(
-                "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                (mid, "pull", now, json.dumps({"repo_id": repo_id, "file": chosen_file})),
-            )
-            conn.commit()
-            console.print(
-                f"[green]✓ Downloaded to {local_path} ({size_gb:.2f} GB). Registry updated.[/green]"
-            )
-
-    conn.close()
-
-
-# ─── removeall ────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.option("--dry-run", is_flag=True, help="Show what would be removed without actually removing")
-def removeall(dry_run):
-    """Remove all models with status='deleted' from the registry."""
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    now = now_iso()
-
-    deleted = conn.execute(
-        "SELECT * FROM models WHERE status='deleted' ORDER BY display_name"
-    ).fetchall()
-
-    conn.close()
-
-    if not deleted:
-        console.print("[green]No deleted models found.[/green]")
-        return
-
-    if dry_run:
-        console.print(f"[yellow]Would remove {len(deleted)} model(s):[/yellow]")
-        for row in deleted:
-            console.print(f"  - {row['display_name']} [{row['backend']}]")
-        return
-
-    if not click.confirm(f"Remove {len(deleted)} model(s) from registry?", default=False):
-        return
-
-    removed = 0
-    for row in deleted:
-        conn = get_db(config)
-        conn.execute(
-            "UPDATE models SET status='deleted', last_updated=? WHERE id=?",
-            (now, row["id"]),
-        )
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "removeall", now, None),
-        )
-        conn.commit()
-        conn.close()
-        removed += 1
-        console.print(f"  [green]✓[/green] {row['display_name']}")
-
-    console.print(f"\n[green]✓ Removed {removed} model(s) from registry.[/green]")
-
-
-# ─── tag ──────────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("model")
-@click.argument("tags", nargs=-1)
-def tag(model, tags):
-    """Add tags to a model. Multiple tags can be provided."""
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    row = find_model(conn, model)
-    now = now_iso()
-    try:
-        current_tags = []
-        if row["tags"]:
-            try:
-                current_tags = json.loads(row["tags"])
-            except json.JSONDecodeError:
-                current_tags = [row["tags"]]
-
-        new_tags = list(tags)
-        for t in new_tags:
-            if t not in current_tags:
-                current_tags.append(t)
-
-        conn.execute(
-            "UPDATE models SET tags=?, last_updated=? WHERE id=?",
-            (json.dumps(current_tags), now, row["id"]),
-        )
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "tag", now, json.dumps(current_tags)),
-        )
-        conn.commit()
-        console.print(f"[green]✓ Tags updated: {', '.join(current_tags)}[/green]")
-    finally:
-        conn.close()
-
-
-# ─── untag ────────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("model")
-@click.argument("tags", nargs=-1)
-def untag(model, tags):
-    """Remove tags from a model. If no tags provided, removes all tags."""
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    row = find_model(conn, model)
-    now = now_iso()
-    try:
-        current_tags = []
-        if row["tags"]:
-            try:
-                current_tags = json.loads(row["tags"])
-            except json.JSONDecodeError:
-                current_tags = [row["tags"]]
-
-        if not tags:
-            current_tags = []
-        else:
-            for t in tags:
-                if t in current_tags:
-                    current_tags.remove(t)
-
-        conn.execute(
-            "UPDATE models SET tags=?, last_updated=? WHERE id=?",
-            (json.dumps(current_tags) if current_tags else None, now, row["id"]),
-        )
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "untag", now, json.dumps(current_tags) if current_tags else None),
-        )
-        conn.commit()
-        if current_tags:
-            console.print(f"[green]✓ Tags updated: {', '.join(current_tags)}[/green]")
-        else:
-            console.print("[green]✓ All tags removed.[/green]")
-    finally:
-        conn.close()
-
-
-# ─── restore ──────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.option("--dry-run", is_flag=True, help="Show what would be downloaded without downloading")
-@click.pass_context
-def restore(ctx, dry_run):
-    """Re-download all missing ComfyUI models that have a known source.
-
-    Models with source_type 'comfyui_civitai' are re-pulled via their stored
-    source_url. Models with source_type 'comfyui_hf' are re-pulled via their
-    hf_repo, using the stored file_path basename to select the right file.
-    """
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-
-    restorable = conn.execute(
-        """SELECT * FROM models
-           WHERE backend='comfyui' AND currently_local=0
-             AND (source_url IS NOT NULL OR hf_repo IS NOT NULL)
-           ORDER BY display_name"""
-    ).fetchall()
-
-    no_source = conn.execute(
-        """SELECT display_name FROM models
-           WHERE backend='comfyui' AND currently_local=0
-             AND source_url IS NULL AND hf_repo IS NULL
-           ORDER BY display_name"""
-    ).fetchall()
-
-    conn.close()
-
-    if not restorable and not no_source:
-        console.print("[green]No missing ComfyUI models found.[/green]")
-        return
-
-    if no_source:
-        console.print(
-            f"[yellow]WARNING: {len(no_source)} model(s) have no recorded source and cannot be restored:[/yellow]"
-        )
-        for row in no_source:
-            console.print(f"  [dim]- {row['display_name']}[/dim]")
-
-    if not restorable:
-        return
-
-    console.print(f"\n[bold]{len(restorable)} model(s) queued for restore:[/bold]")
-    for row in restorable:
-        src = row["source_url"] or row["hf_repo"]
-        subdir_label = f"[dim] -> {row['variant']}[/dim]" if row["variant"] else ""
-        console.print(f"  - {row['display_name']}{subdir_label}  [dim]({src})[/dim]")
-
-    if dry_run:
-        return
-
-    if not click.confirm(f"\nDownload {len(restorable)} model(s)?", default=True):
-        return
-
-    failed = []
-    for row in restorable:
-        console.rule(f"[bold]{row['display_name']}[/bold]")
-
-        subdir = row["variant"] or None
-
-        if row["source_url"]:
-            ref = row["source_url"]
-            file_pattern = None
-        else:
-            ref = row["hf_repo"]
-            file_pattern = Path(row["file_path"]).name if row["file_path"] else None
-
-        if not subdir and row["file_path"]:
-            # Derive subdir from the stored file path relative to base_dir
-            comfy_cfg = config["backends"].get("comfyui", {})
-            base_dir = Path(comfy_cfg.get("base_dir", ""))
-            try:
-                rel = Path(row["file_path"]).relative_to(base_dir)
-                subdir = rel.parts[0] if len(rel.parts) > 1 else None
-            except ValueError:
-                pass
-
-        try:
-            ctx.invoke(pull, ref=ref, backend="comfyui", file_pattern=file_pattern, subdir=subdir)
-        except SystemExit:
-            failed.append(row["display_name"])
-        except Exception as e:
-            console.print(f"[red]Error: {e}[/red]")
-            failed.append(row["display_name"])
-
-    console.rule()
-    if failed:
-        console.print(f"[red]Failed to restore {len(failed)} model(s):[/red]")
-        for name in failed:
-            console.print(f"  - {name}")
-    else:
-        console.print(f"[green]All {len(restorable)} model(s) restored.[/green]")
-
-
-# ─── copy ─────────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("src_backend")
-@click.argument("dst_backend")
-@click.argument("model_name")
-def copy(src_backend, dst_backend, model_name):
-    """Copy a model from one backend to another.
-
-    Copies the model files and creates a new registry entry for the destination
-    backend. The source model must exist in the registry.
-
-    Example: mr copy llamaserver llamacpp Gembrain
-    """
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    now = now_iso()
-    
-    try:
-        # Find the source model
-        rows = conn.execute(
-            """SELECT * FROM models 
-               WHERE display_name LIKE ? AND backend=? 
-               ORDER BY display_name""",
-            (f"%{model_name}%", src_backend),
-        ).fetchall()
-        
-        if not rows:
-            console.print(f"[red]Model '{model_name}' not found in backend '{src_backend}'[/red]")
-            return
-        if len(rows) > 1:
-            console.print(f"[yellow]Multiple models match '{model_name}' in '{src_backend}':[/yellow]")
-            for i, r in enumerate(rows, 1):
-                console.print(f"  {i}. {r['display_name']}")
-            choice = click.prompt("Pick a number", type=click.IntRange(1, len(rows)))
-            row = rows[choice - 1]
-        else:
-            row = rows[0]
-        
-        console.print(f"Copying [bold]{row['display_name']}[/bold] from {src_backend} to {dst_backend}...")
-        
-        # Get file_path from source
-        src_path = Path(row["file_path"])
-        if not src_path.exists():
-            console.print(f"[red]Source file not found: {src_path}[/red]")
-            return
-        
-        # Determine destination based on backend config
-        dst_cfg = config["backends"].get(dst_backend, {})
-        if dst_backend == "ollama":
-            console.print(f"[red]Cannot copy to Ollama backend - use 'mr pull' instead[/red]")
-            return
-        
-        dst_model_dir = Path(dst_cfg.get("model_dir", ""))
-        if not dst_model_dir.exists():
-            console.print(f"[red]Destination directory does not exist: {dst_model_dir}[/red]")
-            return
-        
-        # Create destination directory
-        repo_name = src_path.parent.name
-        dst_dir = dst_model_dir / repo_name
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Copy all files from source directory
-        import shutil
-        for f in src_path.parent.glob("*"):
-            if f.is_file():
-                dest_file = dst_dir / f.name
-                console.print(f"  Copying {f.name}...")
-                shutil.copy2(f, dest_file)
-        
-        # Find the main file in destination
-        dst_files = list(dst_dir.glob("*.gguf"))
-        if not dst_files:
-            console.print(f"[red]No GGUF files found in destination directory[/red]")
-            return
-        
-        main_file = max(dst_files, key=lambda f: f.stat().st_size)
-        main_path = Path(main_file)
-        
-        # Calculate size
-        total_size = sum(f.stat().st_size for f in dst_files)
-        size_gb = round(total_size / (1024 ** 3), 2)
-        
-        # Create new registry entry
-        variant = parse_variant_from_filename(main_path.name)
-        display_name = dst_dir.name
-        
-        conn.execute(
-            """INSERT INTO models
-               (display_name, hf_repo, variant, backend, source_type,
-                file_path, size_gb, currently_local, first_seen, last_updated)
-               VALUES (?,?,?,?,?,?,?,1,?,?)""",
-            (display_name, row["hf_repo"], variant, dst_backend, dst_backend,
-             str(main_path), size_gb, now, now),
-        )
-        mid = _last_id(conn)
-        
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (mid, "copy", now, json.dumps({"from": f"{src_backend}:{row['display_name']}", "to": f"{dst_backend}:{display_name}"})),
-        )
-        conn.commit()
-        console.print(f"[green]✓ Copied to {dst_dir} ({size_gb:.2f} GB). Registry updated.[/green]")
-        
-    finally:
-        conn.close()
-
-
-# ─── rename ───────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("model")
-@click.argument("new_name")
-def rename(model, new_name):
-    """Rename the directory containing a model, keeping the file name unchanged.
-
-    Only the parent directory name is changed on disk. The file name and display_name
-    in the registry remain unchanged.
-    """
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    row = find_model(conn, model)
-    now = now_iso()
-    try:
-        if row["backend"] == "ollama":
-            console.print("[yellow]Ollama models don't have directories to rename.[/yellow]")
-            return
-
-        if not row["file_path"]:
-            console.print("[red]No file_path recorded for this model — cannot rename on disk.[/red]")
-            return
-
-        old_path = Path(row["file_path"])
-        old_dir = old_path.parent
-        new_dir = old_dir.with_name(new_name)
-
-        if not old_dir.exists():
-            console.print(f"[yellow]Directory not found on disk: {old_dir}[/yellow]")
-            if not click.confirm("Update registry path anyway?", default=False):
-                return
-        else:
-            if new_dir.exists():
-                console.print(f"[red]Directory already exists: {new_dir} — aborting.[/red]")
-                return
-            old_dir.rename(new_dir)
-            console.print(f"[green]✓ Renamed directory: {old_dir.name} → {new_dir.name}[/green]")
-
-        new_path = new_dir / old_path.name
-        conn.execute(
-            "UPDATE models SET file_path=?, last_updated=? WHERE id=?",
-            (str(new_path), now, row["id"]),
-        )
-
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "rename", now, f"{old_dir.name} → {new_dir.name}"),
-        )
-        conn.commit()
-        console.print(f"[green]✓ File path updated in registry[/green]")
-    finally:
-        conn.close()
-
-
-# ─── delete ───────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("model")
-def delete(model):
-    """Delete a model from Ollama or disk. Keeps DB record, sets status=deleted."""
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    row = find_model(conn, model)
-    now = now_iso()
-    try:
-        if not click.confirm(f"Delete '{row['display_name']}'?", default=False):
-            return
-
-        if row["backend"] == "ollama":
-            container = config["backends"]["ollama"]["docker_container"]
-            result = subprocess.run(
-                ["docker", "exec", container, "ollama", "rm", row["ollama_name"]],
-                capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                console.print(f"[red]Delete failed: {result.stderr.strip()}[/red]")
-                return
-            console.print("[green]✓ Removed from Ollama.[/green]")
-
-        elif row["backend"] != "ollama":
-            if row["file_path"]:
-                p = Path(row["file_path"])
-                if p.exists():
-                    p.unlink()
-                    console.print(f"[green]✓ Deleted file: {p}[/green]")
-                else:
-                    console.print(f"[yellow]File not found (already gone?): {p}[/yellow]")
-
-        conn.execute(
-            "UPDATE models SET currently_local=0, status='deleted', last_updated=? WHERE id=?",
-            (now, row["id"]),
-        )
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "delete", now, None),
-        )
-        conn.commit()
-        console.print("[green]✓ Registry updated (status=deleted).[/green]")
-    finally:
-        conn.close()
-
-
-# ─── remove ───────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("model")
-def remove(model):
-    """Remove a model from the registry (hard delete). Completely removes the DB entry."""
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    row = find_model(conn, model)
-    now = now_iso()
-    try:
-        if not click.confirm(f"Delete '{row['display_name']}' from registry?", default=False):
-            return
-
-        conn.execute("DELETE FROM events WHERE model_id=?", (row["id"],))
-        conn.execute("DELETE FROM models WHERE id=?", (row["id"],))
-        conn.commit()
-        console.print("[green]✓ Model deleted from registry.[/green]")
-    finally:
-        conn.close()
-
-
-# ─── blacklist ────────────────────────────────────────────────────────────────
-
-@cli.command()
-@click.argument("model")
-@click.argument("reason", nargs=-1, required=False)
-def blacklist(model, reason):
-    """Set a model's status to blacklisted, record reason, and delete it.
-
-    Partial name matching works: 'Peach' matches the full ollama model name.
-    Works even if the model isn't in the registry yet (creates a new entry).
-    REASON can be passed inline or left blank to be prompted.
-    """
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    init_db(conn)
-    now = now_iso()
-
-    # Manual lookup so we can handle "not found" ourselves
-    rows = conn.execute(
-        """SELECT * FROM models
-           WHERE display_name LIKE ? OR ollama_name LIKE ?
-           ORDER BY display_name""",
-        (f"%{model}%", f"%{model}%"),
-    ).fetchall()
-
-    try:
-        if not rows:
-            console.print(f"[yellow]'{model}' not found in registry.[/yellow]")
-            if not click.confirm("Add it as a new blacklisted entry?", default=True):
-                return
-            hf_repo, variant = parse_hf_repo_from_ollama(model)
-            _bl_backends = ["ollama"] + get_gguf_backend_names(config) + ["comfyui"]
-            backend = click.prompt(
-                "Backend", type=click.Choice(_bl_backends), default="ollama"
-            )
-            conn.execute(
-                """INSERT INTO models
-                   (display_name, hf_repo, variant, backend, source_type,
-                    ollama_name, currently_local, first_seen, last_updated)
-                   VALUES (?,?,?,?,?,?,0,?,?)""",
-                (model, hf_repo, variant, backend, get_source_type(model),
-                 model if backend == "ollama" else None, now, now),
-            )
-            mid = _last_id(conn)
-            row = conn.execute("SELECT * FROM models WHERE id=?", (mid,)).fetchone()
-        elif len(rows) == 1:
-            row = rows[0]
-        else:
-            console.print(f"[yellow]Multiple models match '{model}':[/yellow]")
-            for i, r in enumerate(rows, 1):
-                console.print(f"  {i}. {r['display_name']}  [{r['backend']}]")
-            choice = click.prompt("Pick a number", type=click.IntRange(1, len(rows)))
-            row = rows[choice - 1]
-
-        reason_text = " ".join(reason) if reason else click.prompt("Reason for blacklisting")
-        notes = row["notes"] or ""
-        notes += f"\n[{now}] BLACKLISTED: {reason_text}"
-
-        conn.execute(
-            "UPDATE models SET status='blacklisted', notes=?, last_updated=? WHERE id=?",
-            (notes, now, row["id"]),
-        )
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "blacklist", now, reason_text),
-        )
-
-        # Auto-delete if currently local
-        if row["currently_local"]:
-            if row["backend"] == "ollama" and row["ollama_name"]:
-                container = config["backends"]["ollama"]["docker_container"]
-                result = subprocess.run(
-                    ["docker", "exec", container, "ollama", "rm", row["ollama_name"]],
-                    capture_output=True, text=True,
-                )
-                if result.returncode == 0:
-                    console.print("[green]✓ Removed from Ollama.[/green]")
-                else:
-                    console.print(f"[yellow]⚠ Ollama delete failed: {result.stderr.strip()}[/yellow]")
-            elif row["backend"] != "ollama" and row["file_path"]:
-                p = Path(row["file_path"])
-                if p.exists():
-                    p.unlink()
-                    console.print(f"[green]✓ Deleted file: {p}[/green]")
-            conn.execute(
-                "UPDATE models SET currently_local=0 WHERE id=?", (row["id"],)
-            )
-            conn.execute(
-                "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                (row["id"], "delete", now, "auto-deleted on blacklist"),
-            )
-
-        conn.commit()
-        console.print(f"[red]✓ {row['display_name']} blacklisted.[/red]")
-    finally:
-        conn.close()
-
-
-# ─── enrich ───────────────────────────────────────────────────────────────────
-
-@cli.command()
-def enrich():
-    """Fetch HuggingFace metadata for all models with hf_repo set."""
-    try:
-        import requests
-    except ImportError:
-        console.print("[red]requests not installed. Run: pip install requests[/red]")
-        return
-
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    now = now_iso()
-
-    token_env = config["huggingface"]["token_env_var"]
-    token = os.environ.get(token_env)
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-
-    rows = conn.execute(
-        "SELECT id, hf_repo, display_name FROM models WHERE hf_repo IS NOT NULL AND currently_local=1 AND status = 'installed'"
-    ).fetchall()
-
-    if not rows:
-        console.print("No models with hf_repo to enrich.")
-        conn.close()
-        return
-
-    try:
-        console.print(f"Enriching [bold]{len(rows)}[/bold] model(s) from HuggingFace API...")
-
-        def fetch_hf(repo_id, retries=3):
-            url = f"https://huggingface.co/api/models/{repo_id}"
-            for attempt in range(retries):
-                try:
-                    resp = requests.get(url, headers=headers, timeout=15)
-                    if resp.status_code == 200:
-                        return resp.json()
-                    if resp.status_code == 429:
-                        wait = 2 ** (attempt + 1)
-                        console.print(f"[yellow]Rate limited — waiting {wait}s...[/yellow]")
-                        time.sleep(wait)
-                        continue
-                    if resp.status_code == 404:
-                        return None
-                    return None
-                except requests.RequestException:
-                    time.sleep(1)
-            return None
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Enriching...", total=len(rows))
-
-            for row in rows:
-                progress.update(task, description=row["display_name"][:45])
-                data = fetch_hf(row["hf_repo"])
-
-                if data:
-                    # Attempt to extract param count from tags
-                    param_count = None
-                    for tag in data.get("tags", []):
-                        m = re.match(r"^(\d+(?:\.\d+)?[BbMmKk])$", tag)
-                        if m:
-                            param_count = m.group(1).upper()
-                            break
-
-                    # Architecture from model config
-                    architecture = None
-                    cfg = data.get("config")
-                    if isinstance(cfg, dict):
-                        architecture = cfg.get("model_type")
-
-                    hf_downloads = data.get("downloads")
-                    hf_likes = data.get("likes")
-                    hf_last_modified = data.get("lastModified")
-
-                    conn.execute(
-                        """UPDATE models SET
-                           param_count      = COALESCE(?, param_count),
-                           architecture     = COALESCE(?, architecture),
-                           hf_downloads     = ?,
-                           hf_likes         = ?,
-                           hf_last_modified = ?,
-                           last_updated     = ?
-                           WHERE id=?""",
-                        (param_count, architecture, hf_downloads,
-                         hf_likes, hf_last_modified, now, row["id"]),
-                    )
-
-                    # Try to extract context window from local GGUF file if available
-                    local_rows = conn.execute(
-                        "SELECT id, file_path, backend FROM models WHERE hf_repo=? AND backend IN ('llamacpp', 'llamaserver')",
-                        (row["hf_repo"],)
-                    ).fetchall()
-                    for local_row in local_rows:
-                        if local_row["file_path"]:
-                            context_window = parse_context_window_from_gguf(local_row["file_path"])
-                            if context_window:
-                                conn.execute(
-                                    "UPDATE models SET context_window=? WHERE id=?",
-                                    (context_window, local_row["id"])
-                                )
-                                console.print(f"  [dim]Context window: {context_window} tokens[/dim]")
-                    conn.execute(
-                        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                        (row["id"], "enrich", now, json.dumps({"hf_downloads": hf_downloads})),
-                    )
-
-                progress.advance(task)
-                time.sleep(0.5)
-
-        conn.commit()
-
-        # ── CivitAI enrichment phase ─────────────────────────────────────────────
-        civitai_rows = conn.execute(
-            "SELECT id, display_name, source_url, source_type FROM models" 
-            " WHERE source_type='comfyui_civitai' AND source_url IS NOT NULL AND currently_local=1 AND status = 'installed'"
-            " WHERE source_type='comfyui_civitai' AND source_url IS NOT NULL"
-        ).fetchall()
-
-        if civitai_rows:
-            civitai_cfg = config.get("civitai", {})
-            civitai_token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
-            civitai_token = os.environ.get(civitai_token_env)
-
-            console.print(f"\nEnriching [bold]{len(civitai_rows)}[/bold] CivitAI model(s)...")
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task("CivitAI...", total=len(civitai_rows))
-
-                for row in civitai_rows:
-                    progress.update(task, description=row["display_name"][:45])
-                    version_id = parse_civitai_version_id(row["source_url"])
-                    if not version_id:
-                        progress.advance(task)
-                        continue
-
-                    url = f"https://civitai.com/api/v1/model-versions/{version_id}"
-                    params = {"token": civitai_token} if civitai_token else {}
-                    try:
-                        resp = requests.get(url, params=params, timeout=15)
-                        if resp.status_code != 200:
-                            progress.advance(task)
-                            time.sleep(0.5)
-                            continue
-                        data = resp.json()
-                    except (requests.RequestException, json.JSONDecodeError):
-                        progress.advance(task)
-                        time.sleep(0.5)
-                        continue
-
-                    base_model = data.get("baseModel")
-                    trained_words = data.get("trainedWords") or []
-                    trigger_words_json = json.dumps(trained_words) if trained_words else None
-
-                    conn.execute(
-                        """UPDATE models SET
-                           base_model    = COALESCE(?, base_model),
-                           trigger_words = COALESCE(?, trigger_words),
-                           last_updated  = ?
-                           WHERE id=?""",
-                        (base_model, trigger_words_json, now, row["id"]),
-                    )
-                    conn.execute(
-                        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                        (row["id"], "enrich", now,
-                         json.dumps({"base_model": base_model, "trigger_words": trained_words})),
-                    )
-                    progress.advance(task)
-                    time.sleep(0.5)
-
-        conn.commit()
-        console.print("[green]✓ Enrichment complete.[/green]")
-    finally:
-        conn.close()
+    console.print(f"\n[green]Enrichment complete.[/green] Updated [bold]{updated_count}[/bold] of [bold]{len(rows)}[/bold] model(s).")
 
 
 # ─── search ───────────────────────────────────────────────────────────────────
