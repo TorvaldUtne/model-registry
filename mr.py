@@ -356,7 +356,7 @@ def resolve_local_file_path(file_path, config=None):
     if not file_path:
         return None
 
-    # Normalize backslashes to forward slashes
+    # Normalize backslashes to forward slashes (also strips UNC \\host\share prefixes' leading slashes cleanly)
     normalized_path_str = file_path.replace("\\", "/")
     p = Path(normalized_path_str)
 
@@ -366,12 +366,33 @@ def resolve_local_file_path(file_path, config=None):
     # If path doesn't exist, check configured backend model_dir directories
     if config:
         for bname, bcfg in config.get("backends", {}).items():
-            if bcfg.get("enabled", False) and "model_dir" in bcfg:
-                model_dir = Path(bcfg["model_dir"])
-                # Try to find the file by its name or relative path within model_dir
-                for candidate_path in [model_dir / p.name, model_dir / normalized_path_str]:
-                    if candidate_path.exists():
-                        return candidate_path
+            if not bcfg.get("enabled", False) or "model_dir" not in bcfg:
+                continue
+            model_dir = Path(bcfg["model_dir"])
+            if not model_dir.exists():
+                continue
+
+            # 1. Direct filename match at top level
+            candidate = model_dir / p.name
+            if candidate.exists():
+                return candidate
+
+            # 2. Try preserving the tail of the original path (e.g. drive-letter paths
+            #    store "SubdirName/file.gguf" after the drive/root — match against that)
+            parts = [seg for seg in normalized_path_str.split("/") if seg and ":" not in seg]
+            for i in range(len(parts)):
+                candidate = model_dir.joinpath(*parts[i:])
+                if candidate.exists():
+                    return candidate
+
+            # 3. Fall back to a recursive filename search within model_dir
+            try:
+                matches = list(model_dir.rglob(p.name))
+                if matches:
+                    return matches[0]
+            except Exception:
+                pass
+
     return None
 
 
@@ -380,12 +401,38 @@ def parse_context_window_from_gguf(file_path, config=None):
     resolved_path = resolve_local_file_path(file_path, config)
     if not resolved_path:
         return None
-        return None
+    resolved_path = str(resolved_path)
 
+    ctx = _read_gguf_context_length(resolved_path)
+    if ctx is not None:
+        return ctx
+
+    # Multi-part GGUF files (e.g. "*-00002-of-00003.gguf") only store the full
+    # metadata header in the first shard. If we resolved to a later shard and
+    # found nothing, retry against sibling shard 1 in the same directory.
+    m = re.search(r"-(\d+)-of-(\d+)\.gguf$", resolved_path, re.IGNORECASE)
+    if m:
+        width = len(m.group(1))
+        shard1_name = re.sub(
+            r"-\d+-of-(\d+)\.gguf$",
+            f"-{1:0{width}d}-of-\\1.gguf",
+            resolved_path,
+            flags=re.IGNORECASE,
+        )
+        if shard1_name != resolved_path and Path(shard1_name).exists():
+            ctx = _read_gguf_context_length(shard1_name)
+            if ctx is not None:
+                return ctx
+
+    return None
+
+
+def _read_gguf_context_length(resolved_path):
+    """Low-level: read context_length metadata from a single GGUF file path."""
     # 1. Prefer standard official `gguf` library if available
     try:
         import gguf
-        reader = gguf.GGUFReader(file_path)
+        reader = gguf.GGUFReader(resolved_path)
         arch = None
         if "general.architecture" in reader.fields:
             part = reader.fields["general.architecture"].parts[-1]
@@ -403,7 +450,7 @@ def parse_context_window_from_gguf(file_path, config=None):
     # 2. Raw binary parser fallback
     try:
         import struct
-        with open(file_path, "rb") as f:
+        with open(resolved_path, "rb") as f:
             magic = f.read(4)
             if magic != b"GGUF":
                 return None
@@ -1599,13 +1646,14 @@ def enrich(enrich_all):
                         update_fields["context_window"] = ctx
 
             # Metadata from HF API
-            if any(row[k] is None for k in ("param_count", "architecture", "hf_downloads", "hf_likes", "hf_last_modified")):
+            if row["hf_repo"] and any(row[k] is None for k in ("param_count", "architecture", "hf_downloads", "hf_likes", "hf_last_modified")):
                 meta = get_hf_metadata(row["hf_repo"], hf_token)
                 if meta:
                     for k, v in meta.items():
                         if v is not None and row[k] is None:
                             update_fields[k] = v
 
+            if update_fields:
                 # Convert any datetime objects to ISO strings
                 for k, v in list(update_fields.items()):
                     if isinstance(v, datetime):
