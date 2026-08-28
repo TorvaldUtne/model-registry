@@ -348,9 +348,38 @@ def parse_variant_from_filename(filename):
 
 
 
-def parse_context_window_from_gguf(file_path):
+def resolve_local_file_path(file_path, config=None):
+    """
+    Resolves a local file path, normalizing backslashes and checking configured model directories.
+    Returns a Path object if the file exists, otherwise None.
+    """
+    if not file_path:
+        return None
+
+    # Normalize backslashes to forward slashes
+    normalized_path_str = file_path.replace("\\", "/")
+    p = Path(normalized_path_str)
+
+    if p.exists():
+        return p
+
+    # If path doesn't exist, check configured backend model_dir directories
+    if config:
+        for bname, bcfg in config.get("backends", {}).items():
+            if bcfg.get("enabled", False) and "model_dir" in bcfg:
+                model_dir = Path(bcfg["model_dir"])
+                # Try to find the file by its name or relative path within model_dir
+                for candidate_path in [model_dir / p.name, model_dir / normalized_path_str]:
+                    if candidate_path.exists():
+                        return candidate_path
+    return None
+
+
+def parse_context_window_from_gguf(file_path, config=None):
     """Extract context window and architecture from GGUF file metadata using the gguf library or raw fallback."""
-    if not file_path or not Path(file_path).exists():
+    resolved_path = resolve_local_file_path(file_path, config)
+    if not resolved_path:
+        return None
         return None
 
     # 1. Prefer standard official `gguf` library if available
@@ -1522,9 +1551,9 @@ def enrich(enrich_all):
     now = now_iso()
     hf_token = os.environ.get(config.get("huggingface", {}).get("token_env_var"))
 
-    where_clause = "WHERE (hf_repo IS NOT NULL AND hf_repo != '') OR (file_path IS NOT NULL AND file_path LIKE '%.gguf')"
+    where_clause = "WHERE 1=1"
     if not enrich_all:
-        where_clause += " AND currently_local=1"
+        where_clause = "WHERE currently_local=1 AND (status IS NULL OR status NOT IN ('deleted', 'blacklisted'))"
 
     rows = conn.execute(f"""
         SELECT id, display_name, hf_repo, backend, file_path, ollama_name,
@@ -1555,15 +1584,16 @@ def enrich(enrich_all):
             update_fields = {}
 
             # Context window
-            if row["context_window"] is None:
-                # First try local GGUF file if path exists
-                if row["file_path"] and Path(row["file_path"]).exists():
-                    ctx = parse_context_window_from_gguf(row["file_path"])
-                    if ctx is not None:
-                        update_fields["context_window"] = ctx
+            # Context window
+            # If it has a local file (`file_path`), try resolving and extracting context from the GGUF file
+            if row["file_path"] and row["context_window"] is None:
+                ctx = parse_context_window_from_gguf(row["file_path"], config)
+                if ctx is not None:
+                    update_fields["context_window"] = ctx
 
-                # If still not found, try Hugging Face
-                if "context_window" not in update_fields and row["hf_repo"]:
+            # If it has `hf_repo`, also enrich HF metadata (downloads, likes, etc.) and HF context window if still missing.
+            if row["hf_repo"]:
+                if row["context_window"] is None and "context_window" not in update_fields:
                     ctx = get_hf_context_window(row["hf_repo"], hf_token)
                     if ctx is not None:
                         update_fields["context_window"] = ctx
