@@ -1090,68 +1090,6 @@ def scan():
     )
 
 
-# ─── enrich ───────────────────────────────────────────────────────────────────
-
-@cli.command()
-def enrich():
-    """Enrich model metadata from external sources (e.g. HuggingFace)."""
-    config = load_config()
-    conn = get_db(config)
-    init_db(conn)
-    now = now_iso()
-    hf_token = os.environ.get(config.get("huggingface", {}).get("token_env_var"))
-    updated_count = 0
-
-    models = conn.execute("SELECT * FROM models WHERE hf_repo IS NOT NULL").fetchall()
-    if not models:
-        console.print("No models with hf_repo found to enrich.")
-        return
-
-    console.print(f"Enriching {len(models)} models from HuggingFace...")
-
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>1.0f}%"),
-        console=console,
-    )
-
-    with progress:
-        task = progress.add_task("[cyan]Enriching models...", total=len(models))
-        for row in models:
-            progress.update(task, description=f"[cyan]Enriching {row['display_name']}...")
-            changes = {}
-            # Fetch HF metadata
-            hf_metadata = get_hf_metadata(row["hf_repo"], hf_token)
-            if hf_metadata:
-                for k in ["param_count", "architecture", "hf_downloads", "hf_likes", "hf_last_modified"]:
-                    if k in hf_metadata and hf_metadata[k] != row[k]:
-                        changes[k] = hf_metadata[k]
-
-            # Fetch HF context window
-            context_window = get_hf_context_window(row["hf_repo"], hf_token)
-            if context_window is not None and context_window != row["context_window"]:
-                changes["context_window"] = context_window
-
-            if changes:
-                set_clauses = [f"{k}=?" for k in changes.keys()]
-                params = list(changes.values()) + [now, row["id"]]
-                conn.execute(
-                    f"UPDATE models SET {', '.join(set_clauses)}, last_updated=? WHERE id=?",
-                    params,
-                )
-                conn.execute(
-                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                    (row["id"], "enrich_updated", now, json.dumps(changes)),
-                )
-                updated_count += 1
-            progress.advance(task)
-
-    conn.commit()
-    conn.close()
-    console.print(f"\n[green]Enrichment complete.[/green] Updated: [bold]{updated_count}[/bold]")
 
 
 # ─── list ─────────────────────────────────────────────────────────────────────
@@ -1589,7 +1527,7 @@ def enrich(enrich_all):
     now = now_iso()
     hf_token = os.environ.get(config.get("huggingface", {}).get("token_env_var"))
 
-    where_clause = "WHERE hf_repo IS NOT NULL AND hf_repo != ''"
+    where_clause = "WHERE (hf_repo IS NOT NULL AND hf_repo != '') OR (file_path IS NOT NULL AND file_path LIKE '%.gguf')"
     if not enrich_all:
         where_clause += " AND currently_local=1"
 
