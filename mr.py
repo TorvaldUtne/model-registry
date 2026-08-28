@@ -247,42 +247,37 @@ def get_hf_metadata(hf_repo, hf_token):
     try:
         from huggingface_hub import HfApi
         hf_api = HfApi(token=hf_token)
-        model_info = hf_api.model_info(repo_id=hf_repo)
+        try:
+            model_info = hf_api.model_info(repo_id=hf_repo)
+        except Exception:
+            # Catch 404 (RepositoryNotFoundError), 401, 403, network drops, etc.
+            return {}
 
         metadata = {}
-        # Param count: usually in model_info.cardData.model_parameters or similar
-        # This is often not directly available or in a consistent format from get_model_info
-        # For now, we'll try common keys. More robust parsing might involve downloading
-        # the model card and parsing it.
         if hasattr(model_info, 'safetensors') and model_info.safetensors and isinstance(model_info.safetensors, dict):
-            # Try to get param_count from safetensors metadata
             for key in ["total_params", "num_params"]:
                 if key in model_info.safetensors:
                     metadata["param_count"] = model_info.safetensors[key]
                     break
 
-        # Architecture
-        if hasattr(model_info, 'cardData') and model_info.cardData and isinstance(model_info.cardData, dict):
-            if "architectures" in model_info.cardData and isinstance(model_info.cardData["architectures"], list) and model_info.cardData["architectures"]:
-                metadata["architecture"] = model_info.cardData["architectures"][0]
-            elif "model_name" in model_info.cardData: # sometimes architecture is part of name
-                name_lower = model_info.cardData["model_name"].lower()
+        card_data = getattr(model_info, 'card_data', None) or getattr(model_info, 'cardData', None)
+        if card_data and isinstance(card_data, dict):
+            if "architectures" in card_data and isinstance(card_data["architectures"], list) and card_data["architectures"]:
+                metadata["architecture"] = card_data["architectures"][0]
+            elif "model_name" in card_data:
+                name_lower = str(card_data["model_name"]).lower()
                 if "llama" in name_lower:
                     metadata["architecture"] = "Llama"
                 elif "mistral" in name_lower:
                     metadata["architecture"] = "Mistral"
 
-        # Downloads and Likes
-        metadata["hf_downloads"] = model_info.downloads
-        metadata["hf_likes"] = model_info.likes
-
-        # Last modified
-        metadata["hf_last_modified"] = model_info.lastModified
+        metadata["hf_downloads"] = getattr(model_info, 'downloads', None)
+        metadata["hf_likes"] = getattr(model_info, 'likes', None)
+        last_mod = getattr(model_info, 'lastModified', None) or getattr(model_info, 'last_modified', None)
+        metadata["hf_last_modified"] = last_mod.isoformat() if hasattr(last_mod, 'isoformat') else str(last_mod) if last_mod else None
 
         return metadata
-
-    except (AttributeError, requests.exceptions.RequestException, json.JSONDecodeError) as e:
-        console.print(f"[yellow]  Warning: Could not fetch HF metadata for {hf_repo}: {e}[/yellow]")
+    except Exception:
         return {}
 
 def get_hf_context_window(hf_repo, hf_token):
