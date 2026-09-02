@@ -1,4 +1,4 @@
-# mr — Model Registry v1.2.5
+# mr — Model Registry v1.2.6
 
 A single-file CLI for tracking, rating, and managing AI models across three local backends: **Ollama** (via Docker), **llama.cpp** (`.gguf` files), and **ComfyUI** (`.safetensors`, `.ckpt`, etc.). State is stored in a local SQLite database.
 
