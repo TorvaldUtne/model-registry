@@ -5,6 +5,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -30,7 +31,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 console = Console()
 
-__version__ = "1.2.6"
+__version__ = "1.2.7"
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
@@ -345,7 +346,10 @@ def get_hf_context_window(hf_repo, hf_token):
 # ─── llama.cpp helpers ────────────────────────────────────────────────────────
 
 def parse_variant_from_filename(filename):
-    """Extract quant variant from a .gguf filename, e.g. Q4_K_M, IQ4_XS."""
+    """Extract quant variant from a .gguf filename, e.g. Q4_K_M, IQ4_XS, UD-Q8_K_XL."""
+    m = re.search(r"[-.](i\d+-[A-Za-z0-9_]+|UD-[A-Za-z0-9_]+|Q\d[^.]*|IQ\d[^.]*|MXFP\d[^.]*|f16|f32|bf16)\.gguf$", filename, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
     m = re.search(r"\.(Q\d[^.]*|IQ\d[^.]*|f16|f32|bf16)\.gguf$", filename, re.IGNORECASE)
     if m:
         return m.group(1).upper()
@@ -362,7 +366,7 @@ def flatten_hf_subdir(directory):
         subdir = subdirs[0]
         console.print(f"  [dim]Flattening: {subdir.name}[/dim]")
         for item in subdir.iterdir():
-            item.rename(directory / item.name)
+            shutil.move(str(item), str(directory / item.name))
         subdir.rmdir()
 
 
@@ -375,7 +379,7 @@ def resolve_local_file_path(file_path, config=None):
         return None
 
     # Normalize backslashes to forward slashes (also strips UNC \\host\share prefixes' leading slashes cleanly)
-    normalized_path_str = file_path.replace("\\", "/")
+    normalized_path_str = str(file_path).replace("\\", "/")
     p = Path(normalized_path_str)
 
     if p.exists():
@@ -1816,13 +1820,511 @@ def pull(ref, variant, backend, file_pattern, subdir):
     init_db(conn)
     now = now_iso()
 
-    # Handle new syntax: if variant provided, construct ref as org/repo:variant
-    if variant and not re.search(r"(?:hf\.co|huggingface\.co)/", ref, re.IGNORECASE):
-        if "/" in ref:
-            ref = f"{ref}:{variant}"
+    try:
+        # Handle new syntax: if variant provided, construct ref as org/repo:variant
+        if variant and not re.search(r"(?:hf\.co|huggingface\.co)/", ref, re.IGNORECASE):
+            if "/" in ref:
+                ref = f"{ref}:{variant}"
+            elif backend in get_gguf_backend_names(config):
+                console.print(f"[red]For {backend}, ref must be 'org/repo' format when using variant argument.[/red]")
+                return
+
+        # Auto-detect backend
+        if backend is None:
+            if parse_civitai_version_id(ref) is not None:
+                backend = "comfyui"
+            elif ref.endswith(".gguf") or ("/" in ref and not re.search(r"(?:hf\.co|huggingface\.co)/", ref, re.IGNORECASE)):
+                backend = "llamacpp"
+            else:
+                backend = "ollama"
+
+        # Pre-pull: check if blacklisted or deleted
+        hf_repo, _ = parse_hf_repo_from_ollama(ref)
+        existing = None
+        if hf_repo:
+            existing = conn.execute(
+                "SELECT * FROM models WHERE hf_repo=?", (hf_repo,)
+            ).fetchone()
+        if not existing:
+            existing = conn.execute(
+                "SELECT * FROM models WHERE display_name LIKE ? OR ollama_name=?",
+                (f"%{ref}%", ref),
+            ).fetchone()
+
+        if existing:
+            if existing["status"] == "blacklisted":
+                console.print("[bold red]⚠ WARNING: This model is BLACKLISTED[/bold red]")
+                console.print(f"  Rating: {existing['rating']}/5" if existing["rating"] else "  Unrated")
+                if existing["notes"]:
+                    for line in (existing["notes"] or "").strip().splitlines()[-3:]:
+                        console.print(f"  {line}")
+                if not click.confirm("Proceed anyway?", default=False):
+                    return
+            elif existing["status"] == "deleted":
+                console.print("[yellow]⚠ This model was previously deleted.[/yellow]")
+                events = conn.execute(
+                    "SELECT * FROM events WHERE model_id=? ORDER BY timestamp DESC LIMIT 5",
+                    (existing["id"],),
+                ).fetchall()
+                for e in events:
+                    console.print(f"  [dim]{e['timestamp']}[/dim]  {e['event_type']}  {e['detail'] or ''}")
+                if not click.confirm("Proceed anyway?", default=False):
+                    return
+
+        # ── Ollama pull ──────────────────────────────────────────────────────────
+        if backend == "ollama":
+            container = config["backends"]["ollama"]["docker_container"]
+            console.print(f"Pulling [bold]{ref}[/bold] via Ollama...")
+            result = subprocess.run(
+                ["docker", "exec", container, "ollama", "pull", ref],
+                text=True,
+            )
+            if result.returncode != 0:
+                console.print("[red]Pull failed.[/red]")
+                return
+
+            hf_repo2, variant2 = parse_hf_repo_from_ollama(ref)
+            source_type = get_source_type(ref)
+
+            existing_ollama = conn.execute(
+                "SELECT * FROM models WHERE backend='ollama' AND (ollama_name=? OR display_name=?)",
+                (ref, ref),
+            ).fetchone()
+
+            if existing_ollama:
+                conn.execute(
+                    """UPDATE models
+                       SET currently_local=1, times_downloaded=times_downloaded+1,
+                           status=CASE WHEN status='deleted' THEN NULL ELSE status END,
+                           last_used=?, last_updated=?
+                       WHERE id=?""",
+                    (now, now, existing_ollama["id"]),
+                )
+                mid = existing_ollama["id"]
+            else:
+                conn.execute(
+                    """INSERT INTO models
+                       (display_name, hf_repo, variant, backend, source_type,
+                        ollama_name, currently_local, times_downloaded, first_seen, last_used, last_updated)
+                       VALUES (?,?,?,?,?,?,1,1,?,?,?)""",
+                    (ref, hf_repo2, variant2, "ollama", source_type, ref, now, now, now),
+                )
+                mid = _last_id(conn)
+
+            conn.execute(
+                "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                (mid, "pull", now, json.dumps({"ref": ref})),
+            )
+            conn.commit()
+            console.print("[green]✓ Pull complete. Registry updated.[/green]")
+
+        # ── GGUF file backends (llamacpp, llamaserver, etc.) ────────────────────
         elif backend in get_gguf_backend_names(config):
-            console.print(f"[red]For {backend}, ref must be 'org/repo' format when using variant argument.[/red]")
-            conn.close()
+            try:
+                from huggingface_hub import hf_hub_download, list_repo_files
+            except ImportError:
+                console.print("[red]huggingface_hub not installed. Run: pip install huggingface_hub[/red]")
+                return
+
+            backend_cfg = config["backends"].get(backend, {})
+            model_dir = Path(backend_cfg.get("model_dir", ""))
+            if not model_dir.exists():
+                console.print(f"[red]Model directory for {backend} does not exist: {model_dir}[/red]")
+                return
+
+            token_env = config.get("huggingface", {}).get("token_env_var", "HF_TOKEN")
+            token = os.environ.get(token_env)
+
+            parsed_repo, parsed_variant = parse_hf_repo_from_ollama(ref)
+            repo_id = parsed_repo if parsed_repo else ref
+            if parsed_variant and not file_pattern:
+                file_pattern = f"*{parsed_variant}*.gguf"
+
+            if "/" not in repo_id:
+                console.print(f"[red]For {backend}, ref must be 'org/repo' or 'hf.co/org/repo:tag' format.[/red]")
+                return
+
+            try:
+                all_files = list(list_repo_files(repo_id, token=token))
+            except Exception as e:
+                console.print(f"[red]Failed to list repo files for {repo_id}: {e}[/red]")
+                return
+
+            gguf_files = [f for f in all_files if f.endswith(".gguf")]
+
+            if not gguf_files:
+                console.print(f"[red]No .gguf files found in {repo_id}[/red]")
+                return
+
+            if file_pattern:
+                pat = file_pattern
+                if not any(c in pat for c in "*?[]") and not pat.endswith(".gguf"):
+                    pat = f"*{pat}*.gguf"
+                matches = [f for f in gguf_files if fnmatch.fnmatch(f.lower(), pat.lower())]
+                if not matches:
+                    console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
+                    return
+                files_to_download = matches
+            elif len(gguf_files) == 1:
+                files_to_download = gguf_files
+            else:
+                console.print(f"Multiple GGUF files in [bold]{repo_id}[/bold]:")
+                for i, f in enumerate(gguf_files, 1):
+                    console.print(f"  {i}. {f}")
+                # For multiple files, ask if user wants all or specific pattern
+                if click.confirm("Download all GGUF files to a subdirectory?", default=True):
+                    files_to_download = gguf_files
+                else:
+                    user_pattern = click.prompt("Enter pattern (e.g., *Q4_K_M*)")
+                    matches = [f for f in gguf_files if fnmatch.fnmatch(f.lower(), user_pattern.lower())]
+                    if not matches:
+                        console.print(f"[red]No files matching '{user_pattern}' in {repo_id}[/red]")
+                        return
+                    files_to_download = matches
+
+            # Create subdirectory for this model based on repo name
+            repo_name = repo_id.split("/")[1] if "/" in repo_id else repo_id
+            # Clean up repo name for use as directory name
+            repo_name = re.sub(r'[^a-zA-Z0-9_.-]', '-', repo_name)
+            target_dir = model_dir / repo_name
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            console.print(f"Downloading {len(files_to_download)} file(s) to [bold]{target_dir}[/bold]...")
+            downloaded_paths = []
+            for gguf_file in files_to_download:
+                downloaded_file_path = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=gguf_file,
+                    local_dir=str(target_dir),
+                    token=token,
+                )
+                local_path = Path(downloaded_file_path)
+
+                # If the downloaded file is not directly in target_dir, move it
+                if local_path.parent != target_dir:
+                    final_path = target_dir / local_path.name
+                    shutil.move(str(local_path), str(final_path))
+                    local_path = final_path
+                    console.print(f"  Flattened {gguf_file} to: {local_path}")
+                else:
+                    console.print(f"  Downloaded: {gguf_file}")
+
+                downloaded_paths.append(str(local_path))
+
+            # Calculate total size of all downloaded files
+            total_size = sum(Path(p).stat().st_size for p in downloaded_paths)
+            size_gb = round(total_size / (1024 ** 3), 2)
+
+            # Use the largest file for main path and name
+            main_file = max(downloaded_paths, key=lambda p: Path(p).stat().st_size)
+            main_path = Path(main_file)
+            variant_val = parse_variant_from_filename(main_path.name) or parsed_variant
+            context_window = parse_context_window_from_gguf(main_path, config)
+            if context_window is None:
+                context_window = get_hf_context_window(repo_id, token)
+
+            # Check if this model already exists in DB
+            existing_by_dir = None
+            for p in downloaded_paths:
+                existing_by_dir = conn.execute(
+                    "SELECT * FROM models WHERE file_path=? AND backend=?", (p, backend)
+                ).fetchone()
+                if existing_by_dir:
+                    break
+            if not existing_by_dir:
+                existing_by_dir = conn.execute(
+                    "SELECT * FROM models WHERE display_name=? AND backend=?", (repo_name, backend)
+                ).fetchone()
+
+            if existing_by_dir:
+                # Update existing model entry
+                conn.execute(
+                    """UPDATE models
+                       SET currently_local=1, times_downloaded=times_downloaded+1,
+                           file_path=?, size_gb=?, last_used=?, last_updated=?, variant=?,
+                           context_window=COALESCE(?, context_window),
+                           status=CASE WHEN status='deleted' THEN NULL ELSE status END
+                       WHERE id=?""",
+                    (main_file, size_gb, now, now, variant_val, context_window, existing_by_dir["id"]),
+                )
+                mid = existing_by_dir["id"]
+            else:
+                # Create new model entry with subdir as display_name
+                conn.execute(
+                    """INSERT INTO models
+                       (display_name, hf_repo, variant, backend, source_type,
+                        file_path, size_gb, context_window, currently_local, times_downloaded,
+                        first_seen, last_used, last_updated)
+                       VALUES (?,?,?,?,?,?,?,?,1,1,?,?,?)""",
+                    (repo_name, repo_id, variant_val, backend, backend,
+                     main_file, size_gb, context_window, now, now, now),
+                )
+                mid = _last_id(conn)
+
+            conn.execute(
+                "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                (mid, "pull", now, json.dumps({"repo_id": repo_id, "files": files_to_download, "subdir": repo_name})),
+            )
+            conn.commit()
+            console.print(
+                f"[green]✓ Downloaded {len(files_to_download)} file(s) to {target_dir} ({size_gb:.2f} GB). Registry updated.[/green]"
+            )
+
+        # ── ComfyUI download (HuggingFace or CivitAI) ────────────────────────────
+        elif backend == "comfyui":
+            comfy_cfg = config["backends"].get("comfyui", {})
+            base_dir = Path(comfy_cfg.get("base_dir", ""))
+            if not base_dir.exists():
+                console.print(f"[red]ComfyUI base_dir does not exist: {base_dir}[/red]")
+                return
+
+            civitai_cfg = config.get("civitai", {})
+            token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
+            civitai_token = os.environ.get(token_env)
+
+            civitai_version_id = parse_civitai_version_id(ref)
+            _civitai_model_id = parse_civitai_model_id(ref)
+
+            # Browse URL with model ID but no version ID — resolve via API
+            if civitai_version_id is None and _civitai_model_id:
+                _dm = re.search(_CIVITAI_DOMAIN_RE, ref)
+                _host = _dm.group(0) if _dm else "civitai.com"
+                console.print(f"Fetching model info from CivitAI API (model {_civitai_model_id})...")
+                civitai_version_id, _api_subdir = fetch_civitai_model_info(
+                    _civitai_model_id, token=civitai_token, host=_host
+                )
+                if civitai_version_id:
+                    console.print(f"  Using latest version [bold]{civitai_version_id}[/bold]")
+                if not subdir and _api_subdir:
+                    subdir = _api_subdir
+                    console.print(f"  Auto-detected subdir [bold]{subdir}[/bold] from CivitAI model type")
+
+            if not subdir:
+                # Auto-detect from AIR tag type field
+                air = parse_air_tag(ref)
+                if air:
+                    subdir = AIR_TYPE_TO_SUBDIR.get(air["type"])
+                    if subdir:
+                        console.print(f"  Auto-detected subdir [bold]{subdir}[/bold] from AIR type '{air['type']}'")
+            if not subdir:
+                subdir = click.prompt("ComfyUI subdir (e.g. checkpoints, loras, vae)")
+
+            dest_dir = base_dir / subdir
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            if civitai_version_id:
+                # ── CivitAI download ─────────────────────────────────────────────
+                try:
+                    import requests as _requests
+                except ImportError:
+                    console.print("[red]requests not installed. Run: pip install requests[/red]")
+                    return
+
+                # Token must be a query param — Authorization header is stripped on CDN redirect
+                _dm = re.search(_CIVITAI_DOMAIN_RE, ref)
+                _civitai_host = _dm.group(0) if _dm else "civitai.com"
+                download_url = f"https://{_civitai_host}/api/download/models/{civitai_version_id}"
+                params = {}
+                if civitai_token:
+                    params["token"] = civitai_token
+                else:
+                    console.print("[yellow]⚠ No CivitAI API key found. Download may fail for gated models.[/yellow]")
+
+                console.print(f"Downloading from CivitAI (version {civitai_version_id})...")
+                resp = _requests.get(download_url, params=params, stream=True, timeout=(30, None))
+                if resp.status_code == 401:
+                    console.print(f"[red]CivitAI download failed: unauthorized. Check your {token_env} env var.[/red]")
+                    return
+                if resp.status_code != 200:
+                    console.print(f"[red]CivitAI download failed (HTTP {resp.status_code})[/red]")
+                    return
+
+                # Get filename from Content-Disposition header
+                cd = resp.headers.get("Content-Disposition", "")
+                filename_match = re.search(r'filename="?([^";\r\n]+)"?', cd)
+                if filename_match:
+                    filename = filename_match.group(1).strip()
+                else:
+                    filename = click.prompt("Filename to save as (no path)")
+
+                local_path = dest_dir / filename
+                total = int(resp.headers.get("Content-Length", 0)) or None
+
+                try:
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TaskProgressColumn(),
+                        console=console,
+                    ) as progress:
+                        task = progress.add_task(f"Downloading {filename}", total=total)
+                        with open(local_path, "wb") as fh:
+                            for chunk in resp.iter_content(chunk_size=8192):
+                                fh.write(chunk)
+                                progress.advance(task, len(chunk))
+                except Exception:
+                    local_path.unlink(missing_ok=True)
+                    raise
+
+                size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
+                fpath = str(local_path)
+
+                air = parse_air_tag(ref)
+                civitai_url = civitai_source_url(ref, civitai_version_id, air["model_id"] if air else None)
+
+                # Check if already in DB by file_path
+                existing_by_path = conn.execute(
+                    "SELECT * FROM models WHERE file_path=?", (fpath,)
+                ).fetchone()
+                if existing_by_path or existing:
+                    row_to_update = existing_by_path or existing
+                    conn.execute(
+                        """UPDATE models
+                           SET currently_local=1, times_downloaded=times_downloaded+1,
+                               file_path=?, size_gb=?, last_used=?, last_updated=?,
+                               source_type='comfyui_civitai', source_url=?,
+                               status=CASE WHEN status='deleted' THEN NULL ELSE status END
+                           WHERE id=?""",
+                        (fpath, size_gb, now, now, civitai_url, row_to_update["id"]),
+                    )
+                    mid = row_to_update["id"]
+                else:
+                    conn.execute(
+                        """INSERT INTO models
+                           (display_name, variant, backend, source_type, source_url,
+                            file_path, size_gb, currently_local, times_downloaded,
+                            first_seen, last_used, last_updated)
+                           VALUES (?,?,?,?,?,?,?,1,1,?,?,?)""",
+                        (local_path.stem, subdir, "comfyui", "comfyui_civitai", civitai_url,
+                         fpath, size_gb, now, now, now),
+                    )
+                    mid = _last_id(conn)
+
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (mid, "pull", now, json.dumps({"civitai_version_id": civitai_version_id, "file": filename})),
+                )
+                conn.commit()
+                console.print(
+                    f"[green]✓ Downloaded to {local_path} ({size_gb:.2f} GB). Registry updated.[/green]"
+                )
+
+            else:
+                # ── HuggingFace download to ComfyUI subdir ───────────────────────
+                try:
+                    from huggingface_hub import hf_hub_download, list_repo_files
+                except ImportError:
+                    console.print("[red]huggingface_hub not installed. Run: pip install huggingface_hub[/red]")
+                    return
+
+                token_env = config.get("huggingface", {}).get("token_env_var", "HF_TOKEN")
+                token = os.environ.get(token_env)
+
+                # Detect full HF resolve URLs: https://huggingface.co/org/repo/resolve/ref/path/file
+                _hf_resolve = re.match(
+                    r"https://huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.+)$",
+                    ref, re.IGNORECASE,
+                )
+                if _hf_resolve:
+                    repo_id     = _hf_resolve.group(1)
+                    revision    = _hf_resolve.group(2)
+                    chosen_file = _hf_resolve.group(3)
+                    console.print(
+                        f"Downloading [bold]{chosen_file}[/bold] from {repo_id} @ {revision}..."
+                    )
+                else:
+                    repo_id  = ref
+                    revision = None
+
+                    if "/" not in repo_id:
+                        console.print("[red]For HuggingFace, ref must be 'org/repo' format or a full resolve URL.[/red]")
+                        return
+
+                    comfy_exts = tuple(comfy_cfg.get("extensions", [".safetensors", ".ckpt", ".pt", ".pth", ".bin"]))
+                    try:
+                        all_files = list(list_repo_files(repo_id, token=token))
+                    except Exception as e:
+                        console.print(f"[red]Failed to list repo files for {repo_id}: {e}[/red]")
+                        return
+                    model_files = [f for f in all_files if f.lower().endswith(comfy_exts)]
+
+                    if not model_files:
+                        console.print(f"[red]No model files found in {repo_id}[/red]")
+                        return
+
+                    if file_pattern:
+                        matches = [f for f in model_files if fnmatch.fnmatch(f.lower(), file_pattern.lower())]
+                        if not matches:
+                            console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
+                            return
+                        chosen_file = matches[0]
+                    elif len(model_files) == 1:
+                        chosen_file = model_files[0]
+                    else:
+                        console.print(f"Multiple model files in [bold]{repo_id}[/bold]:")
+                        for i, f in enumerate(model_files, 1):
+                            console.print(f"  {i}. {f}")
+                        idx = click.prompt("Pick a number", type=click.IntRange(1, len(model_files)))
+                        chosen_file = model_files[idx - 1]
+
+                    console.print(f"Downloading [bold]{chosen_file}[/bold] from {repo_id}...")
+                _hf_kwargs = dict(repo_id=repo_id, filename=chosen_file,
+                                  local_dir=str(dest_dir), token=token)
+                if revision:
+                    _hf_kwargs["revision"] = revision
+                local_path = Path(hf_hub_download(**_hf_kwargs))
+
+                # Flatten any nested subdirectories created by HuggingFace
+                if dest_dir.exists():
+                    flatten_hf_subdir(dest_dir)
+
+                size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
+                fpath = str(local_path)
+
+                existing_by_path = conn.execute(
+                    "SELECT * FROM models WHERE file_path=?", (fpath,)
+                ).fetchone()
+                if existing_by_path or existing:
+                    row_to_update = existing_by_path or existing
+                    conn.execute(
+                        """UPDATE models
+                           SET currently_local=1, times_downloaded=times_downloaded+1,
+                               file_path=?, size_gb=?, hf_repo=?, last_used=?, last_updated=?,
+                               source_type='comfyui_hf',
+                               status=CASE WHEN status='deleted' THEN NULL ELSE status END
+                           WHERE id=?""",
+                        (fpath, size_gb, repo_id, now, now, row_to_update["id"]),
+                    )
+                    mid = row_to_update["id"]
+                else:
+                    conn.execute(
+                        """INSERT INTO models
+                           (display_name, hf_repo, variant, backend, source_type,
+                            file_path, size_gb, currently_local, times_downloaded,
+                            first_seen, last_used, last_updated)
+                           VALUES (?,?,?,?,?,?,?,1,1,?,?,?)""",
+                        (local_path.stem, repo_id, subdir, "comfyui", "comfyui_hf",
+                         fpath, size_gb, now, now, now),
+                    )
+                    mid = _last_id(conn)
+
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (mid, "pull", now, json.dumps({"repo_id": repo_id, "file": chosen_file})),
+                )
+                conn.commit()
+                console.print(
+                    f"[green]✓ Downloaded to {local_path} ({size_gb:.2f} GB). Registry updated.[/green]"
+                )
+
+        else:
+            avail = ["ollama"] + get_gguf_backend_names(config) + ["comfyui"]
+            console.print(f"[red]Unknown backend: '{backend}'. Available backends: {', '.join(avail)}[/red]")
+            return
+
+    finally:
+        conn.close()
 
 
 
