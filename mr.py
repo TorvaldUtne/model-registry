@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Model Registry (mr) - Track, rate, and manage AI models across Ollama and llama.cpp backends."""
+"""Model Registry (mr) - Track, rate, and manage AI models across Ollama, llama.cpp, and ComfyUI backends."""
 
+import difflib
 import fnmatch
 import json
 import os
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -14,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import click
-from huggingface_hub import hf_hub_download, HfApi
+from huggingface_hub import hf_hub_download, list_repo_files, HfApi
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
@@ -31,7 +33,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 console = Console()
 
-__version__ = "1.2.7"
+__version__ = "1.3.0"
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
@@ -155,8 +157,7 @@ def find_model(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
     if not rows:
         console.print(f"[red]No model matching '{name}' found.[/red]")
         all_names = [r["display_name"] for r in conn.execute("SELECT display_name FROM models").fetchall()]
-        name_lower = name.lower()
-        suggestions = [n for n in all_names if name_lower in n.lower()][:5]
+        suggestions = difflib.get_close_matches(name, all_names, n=5, cutoff=0.4)
         if suggestions:
             console.print("Did you mean:")
             for s in suggestions:
@@ -253,7 +254,6 @@ def get_hf_metadata(hf_repo, hf_token):
     if not hf_repo:
         return {}
     try:
-        from huggingface_hub import HfApi
         hf_api = HfApi(token=hf_token)
         try:
             model_info = hf_api.model_info(repo_id=hf_repo)
@@ -263,10 +263,13 @@ def get_hf_metadata(hf_repo, hf_token):
 
         metadata = {}
         if hasattr(model_info, 'safetensors') and model_info.safetensors and isinstance(model_info.safetensors, dict):
-            for key in ["total_params", "num_params"]:
-                if key in model_info.safetensors:
-                    metadata["param_count"] = model_info.safetensors[key]
-                    break
+            st = model_info.safetensors
+            if st.get("total") is not None:
+                metadata["param_count"] = st["total"]
+            elif isinstance(st.get("parameters"), dict) and st["parameters"]:
+                metadata["param_count"] = sum(
+                    v for v in st["parameters"].values() if isinstance(v, (int, float))
+                )
 
         card_data = getattr(model_info, 'card_data', None) or getattr(model_info, 'cardData', None)
         if card_data and isinstance(card_data, dict):
@@ -293,9 +296,6 @@ def get_hf_context_window(hf_repo, hf_token):
     if not hf_repo:
         return None
     try:
-        from huggingface_hub import hf_hub_download, HfApi
-        import json
-        import requests
 
         def _get_context_from_config(repo, token):
             try:
@@ -451,7 +451,63 @@ def parse_context_window_from_gguf(file_path, config=None):
 
 def _read_gguf_context_length(resolved_path):
     """Low-level: read context_length metadata from a single GGUF file path."""
-    # 1. Prefer standard official `gguf` library if available
+    # 1. Fast raw binary parser (reads only header KV pairs in ~5ms without loading tensor table)
+    try:
+        with open(resolved_path, "rb") as f:
+            magic = f.read(4)
+            if magic == b"GGUF":
+                version = struct.unpack("<I", f.read(4))[0]
+                if version in (1, 2, 3):
+                    # v1 uses uint32 (4 bytes), v2 & v3 use uint64 (8 bytes)
+                    if version == 1:
+                        _tensor_count = struct.unpack("<I", f.read(4))[0]
+                        kv_count = struct.unpack("<I", f.read(4))[0]
+                    else:
+                        _tensor_count = struct.unpack("<Q", f.read(8))[0]
+                        kv_count = struct.unpack("<Q", f.read(8))[0]
+
+                    for _ in range(kv_count):
+                        key_len = struct.unpack("<Q" if version >= 2 else "<I", f.read(8 if version >= 2 else 4))[0]
+                        if key_len > 256:  # sanity check
+                            break
+                        key = f.read(key_len).decode("utf-8", errors="ignore")
+                        val_type = struct.unpack("<I", f.read(4))[0]
+
+                        if key.endswith(".context_length") or key == "context_length":
+                            if val_type in (0, 1):  # 8-bit
+                                return struct.unpack("<B", f.read(1))[0]
+                            elif val_type in (2, 3):  # 16-bit
+                                return struct.unpack("<H", f.read(2))[0]
+                            elif val_type in (4, 5):  # 32-bit
+                                return struct.unpack("<I", f.read(4))[0]
+                            elif val_type in (10, 11):  # 64-bit
+                                return struct.unpack("<Q", f.read(8))[0]
+                            break
+                        else:
+                            # Skip values according to type
+                            type_sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+                            if val_type in type_sizes:
+                                f.read(type_sizes[val_type])
+                            elif val_type == 8:  # string
+                                slen = struct.unpack("<Q" if version >= 2 else "<I", f.read(8 if version >= 2 else 4))[0]
+                                f.read(slen)
+                            elif val_type == 9:  # array
+                                atype = struct.unpack("<I", f.read(4))[0]
+                                alen = struct.unpack("<Q" if version >= 2 else "<I", f.read(8 if version >= 2 else 4))[0]
+                                if atype == 8:
+                                    for _ in range(alen):
+                                        slen = struct.unpack("<Q" if version >= 2 else "<I", f.read(8 if version >= 2 else 4))[0]
+                                        f.read(slen)
+                                elif atype in type_sizes:
+                                    f.read(type_sizes[atype] * alen)
+                                else:
+                                    break
+                            else:
+                                break
+    except Exception:
+        pass
+
+    # 2. Fallback to standard official `gguf` library if available
     try:
         import gguf
         reader = gguf.GGUFReader(resolved_path)
@@ -466,64 +522,6 @@ def _read_gguf_context_length(resolved_path):
         for k, v in reader.fields.items():
             if k.endswith(".context_length"):
                 return int(v.parts[-1][0])
-    except Exception:
-        pass
-
-    # 2. Raw binary parser fallback
-    try:
-        import struct
-        with open(resolved_path, "rb") as f:
-            magic = f.read(4)
-            if magic != b"GGUF":
-                return None
-
-            version = struct.unpack("<I", f.read(4))[0]
-            if version >= 3:
-                f.read(8)  # skip tensor count & metadata kv count header padding if needed
-
-            # Read kv pairs looking for context length
-            # Note: GGUF header stores <arch>.context_length (e.g. llama.context_length, qwen2.context_length, etc.)
-            while True:
-                key_type_bytes = f.read(4)
-                if not key_type_bytes or len(key_type_bytes) < 4:
-                    break
-                key_len = struct.unpack("<Q" if version >= 3 else "<I", f.read(8 if version >= 3 else 4))[0]
-                if key_len > 256:  # sanity check
-                    break
-                key = f.read(key_len).decode("utf-8", errors="ignore")
-                val_type = struct.unpack("<I", f.read(4))[0]
-
-                if key.endswith(".context_length") or key == "context_length":
-                    if val_type in (0, 1):  # 8-bit
-                        return struct.unpack("<B", f.read(1))[0]
-                    elif val_type in (2, 3):  # 16-bit
-                        return struct.unpack("<H", f.read(2))[0]
-                    elif val_type in (4, 5):  # 32-bit
-                        return struct.unpack("<I", f.read(4))[0]
-                    elif val_type in (10, 11):  # 64-bit
-                        return struct.unpack("<Q", f.read(8))[0]
-                    break
-                else:
-                    # Skip values according to type
-                    type_sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
-                    if val_type in type_sizes:
-                        f.read(type_sizes[val_type])
-                    elif val_type == 8:  # string
-                        slen = struct.unpack("<Q" if version >= 3 else "<I", f.read(8 if version >= 3 else 4))[0]
-                        f.read(slen)
-                    elif val_type == 9:  # array
-                        atype = struct.unpack("<I", f.read(4))[0]
-                        alen = struct.unpack("<Q" if version >= 3 else "<I", f.read(8 if version >= 3 else 4))[0]
-                        if atype == 8:
-                            for _ in range(alen):
-                                slen = struct.unpack("<Q" if version >= 3 else "<I", f.read(8 if version >= 3 else 4))[0]
-                                f.read(slen)
-                        elif atype in type_sizes:
-                            f.read(type_sizes[atype] * alen)
-                        else:
-                            break
-                    else:
-                        break
     except Exception:
         pass
 
@@ -618,20 +616,16 @@ def parse_civitai_model_id(ref):
 
 def fetch_civitai_model_info(model_id, token=None, host="civitai.com"):
     """Call CivitAI API v1 for a model. Returns (version_id, subdir_hint) or (None, None)."""
-    try:
-        import requests as _requests
-    except ImportError:
-        return None, None
     url = f"https://{host}/api/v1/models/{model_id}"
     params = {}
     if token:
         params["token"] = token
     try:
-        resp = _requests.get(url, params=params, timeout=15)
+        resp = requests.get(url, params=params, timeout=15)
         if resp.status_code != 200:
             return None, None
         data = resp.json()
-    except (_requests.RequestException, json.JSONDecodeError):
+    except (requests.RequestException, json.JSONDecodeError):
         return None, None
     # Default/latest version is first in the list
     versions = data.get("modelVersions", [])
@@ -727,15 +721,25 @@ def scan_comfyui(config, conn):
             ).fetchone()
 
             if existing:
-                conn.execute(
-                    "UPDATE models SET size_gb=?, currently_local=1, last_updated=? WHERE id=?",
-                    (size_gb, now, existing["id"]),
-                )
-                conn.execute(
-                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                    (existing["id"], "scan_updated", now, json.dumps({"size_gb": size_gb})),
-                )
-                updated += 1
+                update_fields = {}
+                if existing["currently_local"] != 1:
+                    update_fields["currently_local"] = 1
+                if (existing["size_gb"] or 0) != size_gb:
+                    update_fields["size_gb"] = size_gb
+                if update_fields:
+                    update_fields["last_updated"] = now
+                    set_clauses = [f"{k}=?" for k in update_fields.keys()]
+                    params = list(update_fields.values()) + [existing["id"]]
+                    conn.execute(
+                        f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
+                        params,
+                    )
+                    event_detail = {k: v for k, v in update_fields.items() if k != "last_updated"}
+                    conn.execute(
+                        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                        (existing["id"], "scan_updated", now, json.dumps(event_detail)),
+                    )
+                    updated += 1
             else:
                 conn.execute(
                     """INSERT INTO models
@@ -938,9 +942,6 @@ def scan():
                 size_gb = om["size_gb"]
                 hf_repo, variant = parse_hf_repo_from_ollama(oname)
                 source_type = get_source_type(oname)
-                context_window = None
-                if hf_repo:
-                    context_window = get_hf_context_window(hf_repo, hf_token)
                 # Deduplicate: same hf_repo already registered this scan pass
                 if hf_repo and hf_repo in seen_hf_repos:
                     console.print(
@@ -964,28 +965,36 @@ def scan():
                         (oname,),
                     ).fetchone()
 
+                # Only hit the HF API when the context window isn't known yet
+                context_window = None
+                if hf_repo and (existing is None or existing["context_window"] is None):
+                    context_window = get_hf_context_window(hf_repo, hf_token)
+
                 if existing:
-                    update_fields = {"size_gb": size_gb, "currently_local": 1, "last_updated": now, "ollama_name": oname}
-                    if context_window is not None:
+                    update_fields = {}
+                    if existing["currently_local"] != 1:
+                        update_fields["currently_local"] = 1
+                    if (existing["size_gb"] or 0) != size_gb:
+                        update_fields["size_gb"] = size_gb
+                    if existing["ollama_name"] != oname:
+                        update_fields["ollama_name"] = oname
+                    if context_window is not None and existing["context_window"] != context_window:
                         update_fields["context_window"] = context_window
 
-                    set_clauses = [f"{k}=?" for k in update_fields.keys()]
-                    params = list(update_fields.values()) + [existing["id"]]
-
-                    conn.execute(
-                        f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
-                        params,
-                    )
-
-                    event_detail = {"size_gb": size_gb, "ollama_name": oname}
-                    if context_window is not None:
-                        event_detail["context_window"] = context_window
-
-                    conn.execute(
-                        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                        (existing["id"], "scan_updated", now, json.dumps(event_detail)),
-                    )
-                    updated += 1
+                    if update_fields:
+                        update_fields["last_updated"] = now
+                        set_clauses = [f"{k}=?" for k in update_fields.keys()]
+                        params = list(update_fields.values()) + [existing["id"]]
+                        conn.execute(
+                            f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
+                            params,
+                        )
+                        event_detail = {k: v for k, v in update_fields.items() if k != "last_updated"}
+                        conn.execute(
+                            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                            (existing["id"], "scan_updated", now, json.dumps(event_detail)),
+                        )
+                        updated += 1
                 else:
                     conn.execute(
                         """INSERT INTO models
@@ -1065,40 +1074,44 @@ def scan():
             size_gb = round(sum(f.stat().st_size for f in subdir_gguf_files) / (1024 ** 3), 4)
 
             # Use subdir name as display_name, variant is subdir name too
+            context_window = parse_context_window_from_gguf(fpath)
+
             existing = conn.execute(
                 "SELECT * FROM models WHERE file_path=?", (fpath,)
             ).fetchone()
 
             if existing:
-                context_window = parse_context_window_from_gguf(fpath)
-                update_fields = {"size_gb": size_gb, "currently_local": 1, "last_updated": now, "variant": variant}
-                if context_window is not None:
+                update_fields = {}
+                if existing["currently_local"] != 1:
+                    update_fields["currently_local"] = 1
+                if (existing["size_gb"] or 0) != size_gb:
+                    update_fields["size_gb"] = size_gb
+                if existing["variant"] != variant:
+                    update_fields["variant"] = variant
+                if context_window is not None and existing["context_window"] != context_window:
                     update_fields["context_window"] = context_window
 
-                set_clauses = [f"{k}=?" for k in update_fields.keys()]
-                params = list(update_fields.values()) + [existing["id"]]
-
-                conn.execute(
-                    f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
-                    params,
-                )
-
-                event_detail = {"size_gb": size_gb, "variant": variant}
-                if context_window is not None:
-                    event_detail["context_window"] = context_window
-
-                conn.execute(
-                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                    (existing["id"], "scan_updated", now, json.dumps(event_detail)),
-                )
-                updated += 1
+                if update_fields:
+                    update_fields["last_updated"] = now
+                    set_clauses = [f"{k}=?" for k in update_fields.keys()]
+                    params = list(update_fields.values()) + [existing["id"]]
+                    conn.execute(
+                        f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
+                        params,
+                    )
+                    event_detail = {k: v for k, v in update_fields.items() if k != "last_updated"}
+                    conn.execute(
+                        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                        (existing["id"], "scan_updated", now, json.dumps(event_detail)),
+                    )
+                    updated += 1
             else:
                 conn.execute(
                     """INSERT INTO models
                        (display_name, variant, backend, source_type,
-                        file_path, size_gb, currently_local, first_seen, last_updated)
-                       VALUES (?,?,?,?,?,?,1,?,?)""",
-                    (subdir.name, variant, bname, bname, fpath, size_gb, now, now),
+                        file_path, size_gb, context_window, currently_local, first_seen, last_updated)
+                       VALUES (?,?,?,?,?,?,?,1,?,?)""",
+                    (subdir.name, variant, bname, bname, fpath, size_gb, context_window, now, now),
                 )
                 mid = _last_id(conn)
                 conn.execute(
@@ -1120,28 +1133,35 @@ def scan():
             ).fetchone()
 
             if existing:
-                update_fields = {"size_gb": size_gb, "currently_local": 1, "last_updated": now}
-                if context_window is not None:
+                update_fields = {}
+                if existing["currently_local"] != 1:
+                    update_fields["currently_local"] = 1
+                if (existing["size_gb"] or 0) != size_gb:
+                    update_fields["size_gb"] = size_gb
+                if context_window is not None and existing["context_window"] != context_window:
                     update_fields["context_window"] = context_window
-                set_clauses = [f"{k}=?" for k in update_fields.keys()]
-                params = list(update_fields.values()) + [existing["id"]]
-                conn.execute(
-                    f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
-                    params,
-                )
-                conn.execute(
-                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-                    (existing["id"], "scan_updated", now, json.dumps(update_fields)),
-                )
-                updated += 1
+
+                if update_fields:
+                    update_fields["last_updated"] = now
+                    set_clauses = [f"{k}=?" for k in update_fields.keys()]
+                    params = list(update_fields.values()) + [existing["id"]]
+                    conn.execute(
+                        f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
+                        params,
+                    )
+                    event_detail = {k: v for k, v in update_fields.items() if k != "last_updated"}
+                    conn.execute(
+                        "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                        (existing["id"], "scan_updated", now, json.dumps(event_detail)),
+                    )
+                    updated += 1
             else:
                 display_name = f.stem
-                context_window = parse_context_window_from_gguf(fpath)
                 conn.execute(
                     """INSERT INTO models
-                       (display_name, variant, backend, source_type,
-                        file_path, size_gb, context_window, currently_local, first_seen, last_updated)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+(display_name, variant, backend, source_type,
+                         file_path, size_gb, context_window, currently_local, first_seen, last_updated)
+                        VALUES (?,?,?,?,?,?,?,1,?,?)""",
                     (display_name, variant, bname, bname, fpath, size_gb, context_window, now, now),
                 )
                 mid = _last_id(conn)
@@ -1331,7 +1351,7 @@ def show(model):
                 lines.append(f"[bold]Context:[/bold]    {int(context_window):,} tokens")
             except (ValueError, TypeError):
                 lines.append(f"[bold]Context:[/bold]    {context_window} tokens")
-    except (KeyError, TypeError):
+    except (KeyError, IndexError, TypeError):
         pass  # context_window column doesn't exist in older DBs
     lines.append(f"[bold]Local:[/bold]      {'yes' if row['currently_local'] else 'no'}")
     lines.append(f"[bold]Downloads:[/bold]  {row['times_downloaded']}")
@@ -1671,7 +1691,6 @@ def enrich(enrich_all):
             update_fields = {}
 
             # Context window
-            # Context window
             # If it has a local file (`file_path`), try resolving and extracting context from the GGUF file
             if row["file_path"] and row["context_window"] is None:
                 ctx = parse_context_window_from_gguf(row["file_path"], config)
@@ -1710,6 +1729,7 @@ def enrich(enrich_all):
                     "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
                     (row["id"], "enrich_updated", now, json.dumps(update_fields)),
                 )
+                conn.commit()
                 updated_count += 1
 
             progress.advance(task)
@@ -1814,6 +1834,8 @@ def pull(ref, variant, backend, file_pattern, subdir):
 
     NEW: For HF downloads with multiple GGUF files, you can specify the variant
     as a second argument: mr pull org/repo Q5_K_M (instead of org/repo:Q5_K_M)
+
+    Returns True on success, False on failure.
     """
     config = load_config()
     conn = get_db(config)
@@ -1827,7 +1849,7 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 ref = f"{ref}:{variant}"
             elif backend in get_gguf_backend_names(config):
                 console.print(f"[red]For {backend}, ref must be 'org/repo' format when using variant argument.[/red]")
-                return
+                return False
 
         # Auto-detect backend
         if backend is None:
@@ -1859,7 +1881,7 @@ def pull(ref, variant, backend, file_pattern, subdir):
                     for line in (existing["notes"] or "").strip().splitlines()[-3:]:
                         console.print(f"  {line}")
                 if not click.confirm("Proceed anyway?", default=False):
-                    return
+                    return False
             elif existing["status"] == "deleted":
                 console.print("[yellow]⚠ This model was previously deleted.[/yellow]")
                 events = conn.execute(
@@ -1869,7 +1891,7 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 for e in events:
                     console.print(f"  [dim]{e['timestamp']}[/dim]  {e['event_type']}  {e['detail'] or ''}")
                 if not click.confirm("Proceed anyway?", default=False):
-                    return
+                    return False
 
         # ── Ollama pull ──────────────────────────────────────────────────────────
         if backend == "ollama":
@@ -1881,7 +1903,7 @@ def pull(ref, variant, backend, file_pattern, subdir):
             )
             if result.returncode != 0:
                 console.print("[red]Pull failed.[/red]")
-                return
+                return False
 
             hf_repo2, variant2 = parse_hf_repo_from_ollama(ref)
             source_type = get_source_type(ref)
@@ -1917,20 +1939,15 @@ def pull(ref, variant, backend, file_pattern, subdir):
             )
             conn.commit()
             console.print("[green]✓ Pull complete. Registry updated.[/green]")
+            return True
 
         # ── GGUF file backends (llamacpp, llamaserver, etc.) ────────────────────
         elif backend in get_gguf_backend_names(config):
-            try:
-                from huggingface_hub import hf_hub_download, list_repo_files
-            except ImportError:
-                console.print("[red]huggingface_hub not installed. Run: pip install huggingface_hub[/red]")
-                return
-
             backend_cfg = config["backends"].get(backend, {})
             model_dir = Path(backend_cfg.get("model_dir", ""))
             if not model_dir.exists():
                 console.print(f"[red]Model directory for {backend} does not exist: {model_dir}[/red]")
-                return
+                return False
 
             token_env = config.get("huggingface", {}).get("token_env_var", "HF_TOKEN")
             token = os.environ.get(token_env)
@@ -1942,19 +1959,19 @@ def pull(ref, variant, backend, file_pattern, subdir):
 
             if "/" not in repo_id:
                 console.print(f"[red]For {backend}, ref must be 'org/repo' or 'hf.co/org/repo:tag' format.[/red]")
-                return
+                return False
 
             try:
                 all_files = list(list_repo_files(repo_id, token=token))
             except Exception as e:
                 console.print(f"[red]Failed to list repo files for {repo_id}: {e}[/red]")
-                return
+                return False
 
             gguf_files = [f for f in all_files if f.endswith(".gguf")]
 
             if not gguf_files:
                 console.print(f"[red]No .gguf files found in {repo_id}[/red]")
-                return
+                return False
 
             if file_pattern:
                 pat = file_pattern
@@ -1963,7 +1980,7 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 matches = [f for f in gguf_files if fnmatch.fnmatch(f.lower(), pat.lower())]
                 if not matches:
                     console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
-                    return
+                    return False
                 files_to_download = matches
             elif len(gguf_files) == 1:
                 files_to_download = gguf_files
@@ -1979,7 +1996,7 @@ def pull(ref, variant, backend, file_pattern, subdir):
                     matches = [f for f in gguf_files if fnmatch.fnmatch(f.lower(), user_pattern.lower())]
                     if not matches:
                         console.print(f"[red]No files matching '{user_pattern}' in {repo_id}[/red]")
-                        return
+                        return False
                     files_to_download = matches
 
             # Create subdirectory for this model based on repo name
@@ -2069,6 +2086,7 @@ def pull(ref, variant, backend, file_pattern, subdir):
             console.print(
                 f"[green]✓ Downloaded {len(files_to_download)} file(s) to {target_dir} ({size_gb:.2f} GB). Registry updated.[/green]"
             )
+            return True
 
         # ── ComfyUI download (HuggingFace or CivitAI) ────────────────────────────
         elif backend == "comfyui":
@@ -2076,7 +2094,7 @@ def pull(ref, variant, backend, file_pattern, subdir):
             base_dir = Path(comfy_cfg.get("base_dir", ""))
             if not base_dir.exists():
                 console.print(f"[red]ComfyUI base_dir does not exist: {base_dir}[/red]")
-                return
+                return False
 
             civitai_cfg = config.get("civitai", {})
             token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
@@ -2114,12 +2132,6 @@ def pull(ref, variant, backend, file_pattern, subdir):
 
             if civitai_version_id:
                 # ── CivitAI download ─────────────────────────────────────────────
-                try:
-                    import requests as _requests
-                except ImportError:
-                    console.print("[red]requests not installed. Run: pip install requests[/red]")
-                    return
-
                 # Token must be a query param — Authorization header is stripped on CDN redirect
                 _dm = re.search(_CIVITAI_DOMAIN_RE, ref)
                 _civitai_host = _dm.group(0) if _dm else "civitai.com"
@@ -2131,21 +2143,28 @@ def pull(ref, variant, backend, file_pattern, subdir):
                     console.print("[yellow]⚠ No CivitAI API key found. Download may fail for gated models.[/yellow]")
 
                 console.print(f"Downloading from CivitAI (version {civitai_version_id})...")
-                resp = _requests.get(download_url, params=params, stream=True, timeout=(30, None))
+                resp = requests.get(download_url, params=params, stream=True, timeout=(30, None))
                 if resp.status_code == 401:
                     console.print(f"[red]CivitAI download failed: unauthorized. Check your {token_env} env var.[/red]")
-                    return
+                    return False
                 if resp.status_code != 200:
                     console.print(f"[red]CivitAI download failed (HTTP {resp.status_code})[/red]")
-                    return
+                    return False
+
+                def _sanitize_filename(name):
+                    """Strip path components and characters unsafe for filenames."""
+                    name = name.strip().replace("\\", "/").split("/")[-1]
+                    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip().lstrip(".")
+                    return name
 
                 # Get filename from Content-Disposition header
                 cd = resp.headers.get("Content-Disposition", "")
                 filename_match = re.search(r'filename="?([^";\r\n]+)"?', cd)
-                if filename_match:
-                    filename = filename_match.group(1).strip()
-                else:
-                    filename = click.prompt("Filename to save as (no path)")
+                filename = _sanitize_filename(filename_match.group(1)) if filename_match else ""
+                if not filename:
+                    filename = _sanitize_filename(click.prompt("Filename to save as (no path)"))
+                if not filename:
+                    filename = f"civitai_{civitai_version_id}.bin"
 
                 local_path = dest_dir / filename
                 total = int(resp.headers.get("Content-Length", 0)) or None
@@ -2177,8 +2196,11 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 existing_by_path = conn.execute(
                     "SELECT * FROM models WHERE file_path=?", (fpath,)
                 ).fetchone()
-                if existing_by_path or existing:
-                    row_to_update = existing_by_path or existing
+                # Only reuse the pre-pull match if it belongs to this backend —
+                # a same-hf_repo row from another backend must not be overwritten
+                existing_comfy = existing if (existing and existing["backend"] == "comfyui") else None
+                if existing_by_path or existing_comfy:
+                    row_to_update = existing_by_path or existing_comfy
                     conn.execute(
                         """UPDATE models
                            SET currently_local=1, times_downloaded=times_downloaded+1,
@@ -2209,15 +2231,10 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 console.print(
                     f"[green]✓ Downloaded to {local_path} ({size_gb:.2f} GB). Registry updated.[/green]"
                 )
+                return True
 
             else:
                 # ── HuggingFace download to ComfyUI subdir ───────────────────────
-                try:
-                    from huggingface_hub import hf_hub_download, list_repo_files
-                except ImportError:
-                    console.print("[red]huggingface_hub not installed. Run: pip install huggingface_hub[/red]")
-                    return
-
                 token_env = config.get("huggingface", {}).get("token_env_var", "HF_TOKEN")
                 token = os.environ.get(token_env)
 
@@ -2239,25 +2256,25 @@ def pull(ref, variant, backend, file_pattern, subdir):
 
                     if "/" not in repo_id:
                         console.print("[red]For HuggingFace, ref must be 'org/repo' format or a full resolve URL.[/red]")
-                        return
+                        return False
 
                     comfy_exts = tuple(comfy_cfg.get("extensions", [".safetensors", ".ckpt", ".pt", ".pth", ".bin"]))
                     try:
                         all_files = list(list_repo_files(repo_id, token=token))
                     except Exception as e:
                         console.print(f"[red]Failed to list repo files for {repo_id}: {e}[/red]")
-                        return
+                        return False
                     model_files = [f for f in all_files if f.lower().endswith(comfy_exts)]
 
                     if not model_files:
                         console.print(f"[red]No model files found in {repo_id}[/red]")
-                        return
+                        return False
 
                     if file_pattern:
                         matches = [f for f in model_files if fnmatch.fnmatch(f.lower(), file_pattern.lower())]
                         if not matches:
                             console.print(f"[red]No files matching '{file_pattern}' in {repo_id}[/red]")
-                            return
+                            return False
                         chosen_file = matches[0]
                     elif len(model_files) == 1:
                         chosen_file = model_files[0]
@@ -2278,6 +2295,9 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 # Flatten any nested subdirectories created by HuggingFace
                 if dest_dir.exists():
                     flatten_hf_subdir(dest_dir)
+                # flatten_hf_subdir may have moved the file up a level — re-resolve
+                if not local_path.exists():
+                    local_path = dest_dir / local_path.name
 
                 size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
                 fpath = str(local_path)
@@ -2285,8 +2305,11 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 existing_by_path = conn.execute(
                     "SELECT * FROM models WHERE file_path=?", (fpath,)
                 ).fetchone()
-                if existing_by_path or existing:
-                    row_to_update = existing_by_path or existing
+                # Only reuse the pre-pull match if it belongs to this backend —
+                # a same-hf_repo row from another backend must not be overwritten
+                existing_comfy = existing if (existing and existing["backend"] == "comfyui") else None
+                if existing_by_path or existing_comfy:
+                    row_to_update = existing_by_path or existing_comfy
                     conn.execute(
                         """UPDATE models
                            SET currently_local=1, times_downloaded=times_downloaded+1,
@@ -2317,11 +2340,12 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 console.print(
                     f"[green]✓ Downloaded to {local_path} ({size_gb:.2f} GB). Registry updated.[/green]"
                 )
+                return True
 
         else:
             avail = ["ollama"] + get_gguf_backend_names(config) + ["comfyui"]
             console.print(f"[red]Unknown backend: '{backend}'. Available backends: {', '.join(avail)}[/red]")
-            return
+            return False
 
     finally:
         conn.close()
@@ -2333,7 +2357,11 @@ def pull(ref, variant, backend, file_pattern, subdir):
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="Show what would be removed without actually removing")
 def removeall(dry_run):
-    """Remove all models with status='deleted' from the registry."""
+    """Purge all models with status='deleted' from the registry (hard delete).
+
+    Deletes the DB rows and their event history. 'mr pull' will no longer warn
+    that these models were previously deleted.
+    """
     config = load_config()
     conn = get_db(config)
     init_db(conn)
@@ -2343,38 +2371,37 @@ def removeall(dry_run):
         "SELECT * FROM models WHERE status='deleted' ORDER BY display_name"
     ).fetchall()
 
-    conn.close()
-
     if not deleted:
         console.print("[green]No deleted models found.[/green]")
+        conn.close()
         return
 
     if dry_run:
-        console.print(f"[yellow]Would remove {len(deleted)} model(s):[/yellow]")
+        console.print(f"[yellow]Would purge {len(deleted)} model(s) from the registry:[/yellow]")
         for row in deleted:
             console.print(f"  - {row['display_name']} [{row['backend']}]")
+        conn.close()
         return
 
-    if not click.confirm(f"Remove {len(deleted)} model(s) from registry?", default=False):
+    if not click.confirm(f"Purge {len(deleted)} model(s) from the registry? This cannot be undone.", default=False):
+        conn.close()
         return
 
     removed = 0
     for row in deleted:
-        conn = get_db(config)
+        conn.execute("DELETE FROM events WHERE model_id=?", (row["id"],))
+        conn.execute("DELETE FROM models WHERE id=?", (row["id"],))
+        # Audit trail (model_id is NULL once the row is gone)
         conn.execute(
-            "UPDATE models SET status='deleted', last_updated=? WHERE id=?",
-            (now, row["id"]),
+            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (NULL, 'purge', ?, ?)",
+            (now, f"purged: {row['display_name']} [{row['backend']}]"),
         )
-        conn.execute(
-            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "removeall", now, None),
-        )
-        conn.commit()
-        conn.close()
         removed += 1
         console.print(f"  [green]✓[/green] {row['display_name']}")
 
-    console.print(f"\n[green]✓ Removed {removed} model(s) from registry.[/green]")
+    conn.commit()
+    conn.close()
+    console.print(f"\n[green]✓ Purged {removed} model(s) from registry.[/green]")
 
 
 # ─── tag ──────────────────────────────────────────────────────────────────────
@@ -2542,7 +2569,9 @@ def restore(ctx, dry_run):
                 pass
 
         try:
-            ctx.invoke(pull, ref=ref, backend="comfyui", file_pattern=file_pattern, subdir=subdir)
+            ok = ctx.invoke(pull, ref=ref, backend="comfyui", file_pattern=file_pattern, subdir=subdir)
+            if not ok:
+                failed.append(row["display_name"])
         except SystemExit:
             failed.append(row["display_name"])
         except Exception as e:
@@ -2565,7 +2594,7 @@ def restore(ctx, dry_run):
 @click.argument("dst_backend")
 @click.argument("model_name")
 def copy(src_backend, dst_backend, model_name):
-    """Copy a model from one backend to another.
+    """Copy a model from one GGUF backend to another.
 
     Copies the model files and creates a new registry entry for the destination
     backend. The source model must exist in the registry.
@@ -2601,15 +2630,24 @@ def copy(src_backend, dst_backend, model_name):
         console.print(f"Copying [bold]{row['display_name']}[/bold] from {src_backend} to {dst_backend}...")
         
         # Get file_path from source
-        src_path = Path(row["file_path"])
-        if not src_path.exists():
-            console.print(f"[red]Source file not found: {src_path}[/red]")
+        if src_backend == "ollama":
+            console.print("[red]Cannot copy from Ollama - ollama models have no local files. Use 'mr pull' instead.[/red]")
+            return
+        if row["backend"] == "comfyui":
+            console.print("[red]Cannot copy from ComfyUI - only GGUF backends are supported.[/red]")
+            return
+        src_path = Path(row["file_path"]) if row["file_path"] else None
+        if not src_path or not src_path.exists():
+            console.print(f"[red]Source file not found: {row['file_path']}[/red]")
             return
         
         # Determine destination based on backend config
         dst_cfg = config["backends"].get(dst_backend, {})
         if dst_backend == "ollama":
             console.print(f"[red]Cannot copy to Ollama backend - use 'mr pull' instead[/red]")
+            return
+        if dst_backend == "comfyui":
+            console.print("[red]Cannot copy to ComfyUI backend - only GGUF backends are supported. Use 'mr pull' instead.[/red]")
             return
         
         dst_model_dir = Path(dst_cfg.get("model_dir", ""))
@@ -2623,7 +2661,6 @@ def copy(src_backend, dst_backend, model_name):
         dst_dir.mkdir(parents=True, exist_ok=True)
         
         # Copy all files from source directory
-        import shutil
         for f in src_path.parent.glob("*"):
             if f.is_file():
                 dest_file = dst_dir / f.name
@@ -2724,6 +2761,96 @@ def rename(model, new_name):
         conn.close()
 
 
+# ─── Model file removal ──────────────────────────────────────────────────────
+
+def delete_model_files(row, config, conn):
+    """Delete a model's files from disk. Returns True if removal succeeded.
+
+    Ollama models are removed via `ollama rm`. File-based models: the main
+    file plus multi-shard siblings (e.g. -00002-of-00003.gguf) are unlinked,
+    and the parent directory is removed when it is exclusively this model's
+    (never a backend root or a ComfyUI category subdir, and only when no other
+    registered model lives inside it).
+    """
+    if row["backend"] == "ollama":
+        container = config["backends"]["ollama"].get("docker_container", "ollama")
+        result = subprocess.run(
+            ["docker", "exec", container, "ollama", "rm", row["ollama_name"]],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            console.print("[green]✓ Removed from Ollama.[/green]")
+            return True
+        console.print(f"[yellow]⚠ Ollama delete failed: {result.stderr.strip()}[/yellow]")
+        return False
+
+    if not row["file_path"]:
+        return False
+
+    resolved = resolve_local_file_path(row["file_path"], config) or Path(row["file_path"])
+    if not resolved.exists():
+        console.print(f"[yellow]File not found (already gone?): {resolved}[/yellow]")
+        return False
+
+    resolved.unlink()
+    console.print(f"[green]✓ Deleted file: {resolved}[/green]")
+
+    # Multi-shard GGUF: delete sibling shards sharing the same prefix
+    m = re.match(r"^(.+?)-(\d+)-of-(\d+)\.gguf$", resolved.name, re.IGNORECASE)
+    if m:
+        shard_re = re.compile(
+            rf"^{re.escape(m.group(1))}-\d+-of-{m.group(3)}\.gguf$", re.IGNORECASE
+        )
+        for sibling in resolved.parent.iterdir():
+            if sibling != resolved and sibling.is_file() and shard_re.match(sibling.name):
+                sibling.unlink()
+                console.print(f"[green]✓ Deleted shard: {sibling.name}[/green]")
+
+    # Remove the parent directory when it is exclusively this model's
+    parent = resolved.parent
+    try:
+        parent_res = parent.resolve()
+    except OSError:
+        parent_res = parent.absolute()
+
+    protected = False
+    inside_backend_root = False
+    for bname, bcfg in config.get("backends", {}).items():
+        if not bcfg.get("enabled", False):
+            continue
+        d = bcfg.get("model_dir") or bcfg.get("base_dir")
+        if not d:
+            continue
+        try:
+            root = Path(d).resolve()
+        except OSError:
+            continue
+        if parent_res == root:
+            protected = True
+        elif parent_res.is_relative_to(root):
+            inside_backend_root = True
+            if bname == "comfyui" and root == parent_res.parent:
+                protected = True  # e.g. <base>/checkpoints holds many models
+
+    if protected or not inside_backend_root:
+        return True
+
+    others = conn.execute(
+        "SELECT file_path FROM models WHERE id != ? AND file_path IS NOT NULL",
+        (row["id"],),
+    ).fetchall()
+    for other in others:
+        try:
+            if Path(other["file_path"]).resolve().is_relative_to(parent_res):
+                return True  # another registered model lives in this directory
+        except (OSError, ValueError):
+            continue
+
+    console.print(f"  [dim]Removing model directory: {parent}[/dim]")
+    shutil.rmtree(parent)
+    return True
+
+
 # ─── delete ───────────────────────────────────────────────────────────────────
 
 @cli.command()
@@ -2739,25 +2866,10 @@ def delete(model):
         if not click.confirm(f"Delete '{row['display_name']}'?", default=False):
             return
 
-        if row["backend"] == "ollama":
-            container = config["backends"]["ollama"]["docker_container"]
-            result = subprocess.run(
-                ["docker", "exec", container, "ollama", "rm", row["ollama_name"]],
-                capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                console.print(f"[red]Delete failed: {result.stderr.strip()}[/red]")
-                return
-            console.print("[green]✓ Removed from Ollama.[/green]")
-
-        elif row["backend"] != "ollama":
-            if row["file_path"]:
-                p = Path(row["file_path"])
-                if p.exists():
-                    p.unlink()
-                    console.print(f"[green]✓ Deleted file: {p}[/green]")
-                else:
-                    console.print(f"[yellow]File not found (already gone?): {p}[/yellow]")
+        removed = delete_model_files(row, config, conn)
+        if row["backend"] == "ollama" and not removed:
+            console.print("[red]Model still present in Ollama; registry not updated.[/red]")
+            return
 
         conn.execute(
             "UPDATE models SET currently_local=0, status='deleted', last_updated=? WHERE id=?",
@@ -2865,21 +2977,7 @@ def blacklist(model, reason):
 
         # Auto-delete if currently local
         if row["currently_local"]:
-            if row["backend"] == "ollama" and row["ollama_name"]:
-                container = config["backends"]["ollama"]["docker_container"]
-                result = subprocess.run(
-                    ["docker", "exec", container, "ollama", "rm", row["ollama_name"]],
-                    capture_output=True, text=True,
-                )
-                if result.returncode == 0:
-                    console.print("[green]✓ Removed from Ollama.[/green]")
-                else:
-                    console.print(f"[yellow]⚠ Ollama delete failed: {result.stderr.strip()}[/yellow]")
-            elif row["backend"] != "ollama" and row["file_path"]:
-                p = Path(row["file_path"])
-                if p.exists():
-                    p.unlink()
-                    console.print(f"[green]✓ Deleted file: {p}[/green]")
+            delete_model_files(row, config, conn)
             conn.execute(
                 "UPDATE models SET currently_local=0 WHERE id=?", (row["id"],)
             )

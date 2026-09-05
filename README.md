@@ -1,4 +1,4 @@
-# mr — Model Registry v1.2.7
+# mr — Model Registry v1.3.0
 
 A single-file CLI for tracking, rating, and managing AI models across three local backends: **Ollama** (via Docker), **llama.cpp** (`.gguf` files), and **ComfyUI** (`.safetensors`, `.ckpt`, etc.). State is stored in a local SQLite database.
 
@@ -141,7 +141,7 @@ export CIVITAI_API_KEY=...      # CivitAI (required for gated models)
 | `rename MODEL NEW_NAME` | Rename the directory containing a model on disk and update the registry entry. File name remains unchanged. |
 | `delete MODEL` | Remove a model from Ollama or disk; DB record is kept with `status=deleted`. |
 | `remove MODEL` | Hard delete a model from the registry (completely removes DB entry). |
-| `removeall` | Remove all models with status='deleted' from the registry. |
+| `removeall` | Purge all models with status='deleted' from the registry (hard delete). |
 | `tag MODEL TAGS...` | Add one or more tags to a model. |
 | `untag MODEL [TAGS...]` | Remove specific tags or all tags if none provided. |
 | `backends` | List configured backend names with their status. |
@@ -238,6 +238,20 @@ Run mr --help for available commands.
 MIT — see [LICENSE](LICENSE).
 
 ## Changelog
+
+### v1.3.0
+- Fixed `param_count` enrichment (HuggingFace `safetensors.total` key was never read)
+- Fixed `mr pull` to ComfyUI overwriting an unrelated Ollama row that shared the same `hf_repo`
+- Rewrote the GGUF context-length reader: the raw header parser (now tried first, ~5ms) conforms to GGUF v1/v2/v3, and the `gguf` library is the fallback. Previously the binary parser read wrong offsets and never found `context_length`
+- `mr enrich` now commits after each model so progress survives interruption; GGUF context extraction no longer needs network calls for local files
+- `mr delete` / `mr blacklist` now remove the whole model directory when it is exclusively that model's (including multi-shard GGUF siblings); backend roots and ComfyUI category subdirs are never removed
+- `mr removeall` now actually purges deleted rows (previously a no-op that re-logged them)
+- Scan no longer re-fetches HuggingFace context windows for models that already have one, and no longer writes no-op `scan_updated` events when nothing changed
+- `mr restore` now reports real failures instead of counting every pull as success
+- CivitAI download filenames are sanitized (no path separators or unsafe characters)
+- `mr copy` rejects Ollama/ComfyUI sources and destinations with clear errors
+- Fixed a crash when a ComfyUI HuggingFace download was flattened before its size was read
+- Fixed broken INSERT for top-level single-file GGUF models (missing `currently_local` value since v1.2.7)
 
 ### v1.1.0
 - Added `mr tag` and `mr untag` commands for model categorization
