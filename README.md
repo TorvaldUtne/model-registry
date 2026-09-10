@@ -1,6 +1,12 @@
-# mr — Model Registry v1.3.0
+# mr — Model Registry v1.4.0
 
-A single-file CLI for tracking, rating, and managing AI models across three local backends: **Ollama** (via Docker), **llama.cpp** (`.gguf` files), and **ComfyUI** (`.safetensors`, `.ckpt`, etc.). State is stored in a local SQLite database.
+A CLI + MCP server for tracking, rating, and managing AI models across three local backends: **Ollama** (via Docker), **llama.cpp** (`.gguf` files), and **ComfyUI** (`.safetensors`, `.ckpt`, etc.). State is stored in a local SQLite database.
+
+Three files, one engine:
+
+- `mr_core.py` — engine/logic (no UI)
+- `mr.py` — interactive CLI (click + rich)
+- `mr_mcp.py` — MCP server so agents can manage the registry over the LAN without shell/filesystem access
 
 ## Features
 
@@ -19,7 +25,7 @@ A single-file CLI for tracking, rating, and managing AI models across three loca
 
 - Python 3.10+
 - Docker (for the Ollama backend)
-- pip packages: `click`, `rich`, `requests`, `huggingface_hub`
+- pip packages: `click`, `rich`, `requests`, `huggingface_hub`, `mcp[streamable-http]`
 
 ## Installation
 
@@ -109,11 +115,42 @@ python mr.py report
   "display": {
     "date_format": "%Y-%m-%d",
     "max_name_width": 60
+  },
+  "mcp": {
+    "host": "0.0.0.0",
+    "port": 8321,
+    "mode": "readonly"
   }
 }
 ```
 
-Set `registry_db` to an absolute path to store the database somewhere other than the script directory. Leave blank to use `registry.db` next to `mr.py`.
+Set `registry_db` to an absolute path to store the database somewhere other than the script directory. Leave blank to use `registry.db` next to `mr.py`. The optional `mcp` section configures the MCP server:
+
+```json
+"mcp": {
+  "host": "0.0.0.0",
+  "port": 8321,
+  "mode": "readonly"
+}
+```
+
+## Agent access via MCP
+
+Start the MCP server so agents (e.g. Hermes) can use `mr` without being given shell or filesystem access:
+
+```bash
+python mr_mcp.py                 # read-only server on 0.0.0.0:8321
+python mr_mcp.py --read-write    # also expose write tools
+mr-serve.bat --read-write        # same via launcher
+```
+
+- Endpoint: `http://<host>:8321/mcp`
+- **Read-only by default**: exposes `mr_list`, `mr_show`, `mr_report`, `mr_search`, `mr_backends` only.
+- **Read-write** (`--read-write` or `"mode": "readwrite"`) additionally exposes `mr_scan`, `mr_enrich`, `mr_rate`, `mr_status`, `mr_note`, `mr_touch`, `mr_tag`, `mr_untag`, `mr_pull`, `mr_delete`, `mr_remove`, `mr_removeall`, `mr_rename`, `mr_copy`, `mr_blacklist`, `mr_restore`.
+- **Destructive tools** (`pull`, `delete`, `remove`, `removeall`, `rename`, `copy`, `blacklist`, `restore`) require `confirm=True` in the call, so an agent always states intent explicitly.
+- No authentication — run it only on a trusted local network.
+
+Tools return structured JSON (never raw shell). Each `engine_*` function in `mr_core.py` is registered once as an `mr_<name>` tool.
 
 ### API tokens
 
@@ -238,6 +275,11 @@ Run mr --help for available commands.
 MIT — see [LICENSE](LICENSE).
 
 ## Changelog
+
+### v1.4.0
+- New architecture: engine extracted to `mr_core.py`; `mr.py` is the CLI; added `mr_mcp.py`, an MCP (Streamable HTTP) server for agent access over the LAN.
+- Implemented read-only / read-write modes with opt-in gating so testing write paths is safe (see "Agent access via MCP").
+- Existing CLI behavior and output preserved; interactive prompts still live in the CLI, engines never prompt.
 
 ### v1.3.0
 - Fixed `param_count` enrichment (HuggingFace `safetensors.total` key was never read)
