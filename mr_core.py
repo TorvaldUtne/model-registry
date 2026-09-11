@@ -695,9 +695,16 @@ def parse_air_tag(ref: str) -> dict | None:
 
     urn:air:{ecosystem}:{type}:civitai:{model_id}@{version_id}
     e.g. urn:air:sdxl:checkpoint:civitai:2218365@2741096
+
+    Also accepts bundled/multi-version tags where a secondary model version is
+    appended with '+', e.g. civitai:133005@782002+695423 — the primary version
+    (the first id after '@') is used.
     """
     s = re.sub(r"^(?:urn:)?(?:air:)?", "", ref.strip(), flags=re.IGNORECASE)
-    m = re.match(r"^([^:]+):([^:]+):civitai:(\d+)@(\d+)$", s, re.IGNORECASE)
+    m = re.match(
+        r"^([^:]+):([^:]+):civitai:(\d+)@(\d+)(?:\+\d+)*$",
+        s, re.IGNORECASE,
+    )
     if not m:
         return None
     return {
