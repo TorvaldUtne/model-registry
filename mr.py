@@ -630,20 +630,21 @@ def pull(ref, variant, backend, file_pattern, subdir):
 
     def _run(**overrides):
         log = _LiveLog(console)
-
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-            transient=True,
-        )
+        progress = None
         task = None
 
         def _cb(done, total, label):
-            nonlocal task
-            if task is None:
+            nonlocal progress, task
+            if progress is None:
+                progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    console=console,
+                    transient=True,
+                )
+                progress.start()
                 task = progress.add_task(f"Downloading {label}", total=total)
             if total:
                 progress.update(task, completed=done)
@@ -651,7 +652,6 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 progress.update(task, total=None, completed=done)
 
         try:
-            progress.start()
             return mr_core.engine_pull(
                 config,
                 ref=ref,
@@ -667,7 +667,8 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 progress_callback=_cb,
             )
         finally:
-            progress.stop()
+            if progress is not None:
+                progress.stop()
 
     while True:
         try:

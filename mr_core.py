@@ -2379,6 +2379,7 @@ def engine_pull(
             _log(log, f"Downloading {len(files_to_download)} file(s) to {target_dir}...")
             downloaded_paths = []
             for gguf_file in files_to_download:
+                _log(log, f"  Downloading {gguf_file}...")
                 downloaded_file_path = hf_hub_download(
                     repo_id=repo_id,
                     filename=gguf_file,
