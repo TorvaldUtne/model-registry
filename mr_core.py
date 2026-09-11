@@ -2208,6 +2208,7 @@ def engine_pull(
     allow_blacklisted: bool = False,
     confirm: bool = False,
     log: list[str] | None = None,
+    progress_callback=None,
 ) -> dict:
     """Pull a model from Ollama, HuggingFace, or CivitAI.
 
@@ -2215,6 +2216,10 @@ def engine_pull(
     a CivitAI version/model URL or AIR tag, or 'civitai:<versionId>'.
 
     Ambiguous multi-file downloads require file_pattern (or download_all=True for GGUF).
+
+    progress_callback: optional callable(downloaded_bytes, total_bytes, label) called
+    as CivitAI download bytes arrive (used by the CLI to drive a progress bar; MCP
+    clients can pass None).
     """
     _require_writes()
     _require_confirm(confirm)
@@ -2525,10 +2530,15 @@ def engine_pull(
 
                 local_path = dest_dir / out_filename
 
+                total = int(resp.headers.get("Content-Length", 0)) or None
+                downloaded = 0
                 try:
                     with open(local_path, "wb") as fh:
                         for chunk in resp.iter_content(chunk_size=8192):
                             fh.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_callback is not None:
+                                progress_callback(downloaded, total, out_filename)
                 except Exception:
                     local_path.unlink(missing_ok=True)
                     raise

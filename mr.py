@@ -16,6 +16,7 @@ import click
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 
 import mr_core
@@ -71,6 +72,18 @@ def _parse_tags(tags):
         return json.loads(tags)
     except json.JSONDecodeError:
         return [tags]
+
+
+class _LiveLog(list):
+    """A log list that prints each line to the console as it is appended."""
+
+    def __init__(self, console_):
+        super().__init__()
+        self._console = console_
+
+    def append(self, item):
+        super().append(item)
+        self._console.print(item)
 
 
 def _handle_engine_error(e):
@@ -616,26 +629,49 @@ def pull(ref, variant, backend, file_pattern, subdir):
     config = load_config()
 
     def _run(**overrides):
-        return mr_core.engine_pull(
-            config,
-            ref=ref,
-            variant=variant,
-            backend=backend,
-            file_pattern=overrides.get("file_pattern", file_pattern),
-            subdir=overrides.get("subdir", subdir),
-            download_all=overrides.get("download_all", False),
-            filename=overrides.get("filename", None),
-            allow_blacklisted=overrides.get("allow_blacklisted", False),
-            confirm=True,
+        log = _LiveLog(console)
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+            transient=True,
         )
+        task = None
+
+        def _cb(done, total, label):
+            nonlocal task
+            if task is None:
+                task = progress.add_task(f"Downloading {label}", total=total)
+            if total:
+                progress.update(task, completed=done)
+            else:
+                progress.update(task, total=None, completed=done)
+
+        try:
+            progress.start()
+            return mr_core.engine_pull(
+                config,
+                ref=ref,
+                variant=variant,
+                backend=backend,
+                file_pattern=overrides.get("file_pattern", file_pattern),
+                subdir=overrides.get("subdir", subdir),
+                download_all=overrides.get("download_all", False),
+                filename=overrides.get("filename", None),
+                allow_blacklisted=overrides.get("allow_blacklisted", False),
+                confirm=True,
+                log=log,
+                progress_callback=_cb,
+            )
+        finally:
+            progress.stop()
 
     while True:
         try:
-            result = _run()
-            if result["backend"] == "ollama":
-                console.print("[green]✓ Pull complete. Registry updated.[/green]")
-            else:
-                console.print(f"[green]✓ Downloaded to {result['target_dir'] if 'target_dir' in result else result.get('file_path','')} ({result['size_gb']:.2f} GB). Registry updated.[/green]")
+            _run()
             return
         except MrError as e:
             if e.details.get("kind") == "gguf_multi":
@@ -644,12 +680,10 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 for i, f in enumerate(files, 1):
                     console.print(f"  {i}. {f}")
                 if click.confirm("Download all GGUF files to a subdirectory?", default=True):
-                    result = _run(download_all=True)
-                    console.print(f"[green]✓ Downloaded to {result['target_dir']} ({result['size_gb']:.2f} GB). Registry updated.[/green]")
+                    _run(download_all=True)
                     return
                 user_pattern = click.prompt("Enter pattern (e.g., *Q4_K_M*)")
-                result = _run(file_pattern=user_pattern)
-                console.print(f"[green]✓ Downloaded to {result['target_dir']} ({result['size_gb']:.2f} GB). Registry updated.[/green]")
+                _run(file_pattern=user_pattern)
                 return
             if e.details.get("kind") == "comfyui_hf_multi":
                 files = e.details["files"]
@@ -657,14 +691,12 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 for i, f in enumerate(files, 1):
                     console.print(f"  {i}. {f}")
                 idx = click.prompt("Pick a number", type=click.IntRange(1, len(files)))
-                result = _run(file_pattern=files[idx - 1])
-                console.print(f"[green]✓ Downloaded to {result['file_path']} ({result['size_gb']:.2f} GB). Registry updated.[/green]")
+                _run(file_pattern=files[idx - 1])
                 return
             if "blacklisted" in str(e) and "allow_blacklisted" in str(e):
                 if not click.confirm("Model is BLACKLISTED. Proceed anyway?", default=False):
                     return
-                result = _run(allow_blacklisted=True)
-                console.print("[green]✓ Pull complete. Registry updated.[/green]")
+                _run(allow_blacklisted=True)
                 return
             if "subdir is required" in str(e):
                 subdir = click.prompt("ComfyUI subdir (e.g. checkpoints, loras, vae)")
