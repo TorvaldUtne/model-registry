@@ -122,19 +122,42 @@ _CIVITAI_DOMAIN_RE = r"civitai\.(?:com|green|red)"
 
 # AIR type field → ComfyUI subdir name
 AIR_TYPE_TO_SUBDIR = {
-    "checkpoint": "checkpoints",
-    "model":      "checkpoints",
-    "vae":        "vae",
-    "lora":       "loras",
-    "locon":      "loras",
-    "lycoris":    "loras",
-    "embedding":  "embeddings",
-    "textualinversion": "embeddings",
-    "hypernet":   "hypernetworks",
-    "controlnet": "controlnet",
-    "upscaler":   "upscale_models",
-    "ipadapter":  "ipadapter",
-    "clipvision": "clip_vision",
+    "checkpoint":        "checkpoints",
+    "checkpoints":       "checkpoints",
+    "model":             "checkpoints",
+    "vae":               "vae",
+    "lora":              "loras",
+    "loras":             "loras",
+    "locon":             "loras",
+    "lycoris":           "loras",
+    "embedding":         "embeddings",
+    "embeddings":        "embeddings",
+    "textualinversion":  "embeddings",
+    "hypernet":          "hypernetworks",
+    "hypernetwork":      "hypernetworks",
+    "hypernetworks":     "hypernetworks",
+    "controlnet":        "controlnet",
+    "upscaler":          "upscale_models",
+    "ipadapter":         "ipadapter",
+    "clipvision":        "clip_vision",
+    "clip":              "clip",
+    "diffusionmodel":    "diffusion_models",
+    "diffusion":         "diffusion_models",
+    "diffusers":         "diffusion_models",
+    "textencoder":       "text_encoders",
+    "textencoders":      "text_encoders",
+    "unet":              "unet",
+    "vaeapprox":         "vae_approx",
+    "motionmodule":      "animatediff_models",
+    "gligen":            "gligen",
+    "photomaker":        "photomaker",
+    "stylemodels":       "style_models",
+    "stylemodel":        "style_models",
+    "sam":               "sams",
+    "sams":              "sams",
+    "facerestoremodels": "facerestore_models",
+    "workflows":         "workflows",
+    "poses":             "poses",
 }
 
 # CivitAI API model type field → ComfyUI subdir name
@@ -149,7 +172,53 @@ CIVITAI_API_TYPE_TO_SUBDIR = {
     "motionmodule":      "animatediff_models",
     "vae":               "vae",
     "poses":             "poses",
+    "diffusionmodel":    "diffusion_models",
+    "diffusion":         "diffusion_models",
+    "diffusers":         "diffusion_models",
+    "textencoder":       "text_encoders",
+    "workflows":         "workflows",
+    "wildcards":         "wildcards",
 }
+
+# CivitAI per-file "type" from /api/v1/model-versions/{id} → ComfyUI subdir name
+# (e.g. a version can ship a 'Diffusion Model' plus a 'VAE' or 'Text Encoder')
+CIVITAI_FILE_TYPE_TO_SUBDIR = {
+    "diffusionmodel": "diffusion_models",
+    "checkpoint":     "checkpoints",
+    "vae":            "vae",
+    "lora":           "loras",
+    "controlnet":     "controlnet",
+    "upscaler":       "upscale_models",
+    "textencoder":    "text_encoders",
+    "motionmodule":   "animatediff_models",
+    "embedding":      "embeddings",
+    "clip":           "clip",
+    "clipvision":     "clip_vision",
+}
+
+
+def comfyui_subdir_for_type(type_: str | None) -> str | None:
+    """Map a CivitAI/AIR type string to a ComfyUI subdir.
+
+    Handles case/punctuation differences ('Diffusion Model', 'diffusionmodel',
+    'DiffusionModel') and the singular→plural mismatch ('diffusionmodel' → the
+    plural subdir 'diffusion_models').
+    """
+    if not type_:
+        return None
+    normalized = re.sub(r"[^a-z0-9]", "", type_.lower())
+    for table in (
+        AIR_TYPE_TO_SUBDIR,
+        CIVITAI_API_TYPE_TO_SUBDIR,
+        CIVITAI_FILE_TYPE_TO_SUBDIR,
+    ):
+        if normalized in table:
+            return table[normalized]
+        if normalized.endswith("s"):
+            singular = table.get(normalized[:-1])
+            if singular:
+                return singular
+    return None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -696,22 +765,26 @@ def parse_air_tag(ref: str) -> dict | None:
     urn:air:{ecosystem}:{type}:civitai:{model_id}@{version_id}
     e.g. urn:air:sdxl:checkpoint:civitai:2218365@2741096
 
-    Also accepts bundled/multi-version tags where a secondary model version is
-    appended with '+', e.g. civitai:133005@782002+695423 — the primary version
-    (the first id after '@') is used.
+    Also accepts bundled/file-specific tags where a CivitAI file id is appended
+    with '+', e.g. civitai:2831028@3305034+3190059 — the version is the id after
+    '@' and the trailing id is the CivitAI file id (see /api/v1/model-versions,
+    file.downloadUrl '?fileId=…').
     """
     s = re.sub(r"^(?:urn:)?(?:air:)?", "", ref.strip(), flags=re.IGNORECASE)
     m = re.match(
-        r"^([^:]+):([^:]+):civitai:(\d+)@(\d+)(?:\+\d+)*$",
+        r"^([^:]+):([^:]+):civitai:(\d+)@(\d+)((?:\+\d+)+)?$",
         s, re.IGNORECASE,
     )
     if not m:
         return None
+    file_suffix = m.group(5) or ""
+    file_id = re.match(r"\+(\d+)", file_suffix).group(1) if file_suffix else None
     return {
         "ecosystem": m.group(1).lower(),
         "type": m.group(2).lower(),
         "model_id": m.group(3),
         "version_id": m.group(4),
+        "file_id": file_id,
     }
 
 
@@ -756,8 +829,63 @@ def fetch_civitai_model_info(
     versions = data.get("modelVersions", [])
     version_id = str(versions[0]["id"]) if versions else None
     api_type = (data.get("type") or "").lower().replace(" ", "")
-    subdir = CIVITAI_API_TYPE_TO_SUBDIR.get(api_type)
+    subdir = comfyui_subdir_for_type(api_type)
     return version_id, subdir
+
+
+def fetch_civitai_version_info(
+    version_id, token=None, host="civitai.com"
+) -> dict | None:
+    """Call CivitAI API v1 for a model version.
+
+    Returns a dict with:
+      base_model:      baseModel string (e.g. 'Krea 2' / 'SDXL 1.0') or None
+      trigger_words:   list[str] of trained trigger words (may be empty)
+      files:           list of dicts with id/name/type/(fp,format)/primary/download_url
+    Returns None on network/API failure (callers should fall back to defaults).
+    """
+    url = f"https://{host}/api/v1/model-versions/{version_id}"
+    params = {}
+    if token:
+        params["token"] = token
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except (requests.RequestException, json.JSONDecodeError):
+        return None
+    files = []
+    for f in data.get("files", []):
+        meta = f.get("metadata") or {}
+        files.append({
+            "id": str(f.get("id")),
+            "name": f.get("name"),
+            "type": f.get("type"),
+            "fp": meta.get("fp"),
+            "format": meta.get("format"),
+            "primary": bool(f.get("primary")),
+            "download_url": f.get("downloadUrl"),
+        })
+    return {
+        "base_model": data.get("baseModel"),
+        "trigger_words": data.get("trainedWords") or [],
+        "files": files,
+    }
+
+
+def civitai_file_download_params(version_info, file_id) -> dict:
+    """Return download query params that pin the download to the requested file.
+
+    CivitAI's download endpoint selects a specific file via 'fileId' (matching
+    the file.downloadUrl returned by /api/v1/model-versions). Falls back to {}
+    (the version's primary file) when the id is unknown.
+    """
+    if not file_id:
+        return {}
+    if version_info and not any(f["id"] == file_id for f in version_info["files"]):
+        return {}
+    return {"fileId": file_id}
 
 
 def civitai_source_url(ref: str, version_id, model_id=None) -> str:
@@ -1004,8 +1132,33 @@ def engine_list(
     query += " ORDER BY display_name"
 
     rows = conn.execute(query, params).fetchall()
+
+    # A model can exist as several registry rows (re-scanned into a new install
+    # dir, same model pulled more than once, etc.), and tags often end up on
+    # only one of them — leaving the tag column empty on the row `mr list`
+    # actually shows. Aggregate tags across every row sharing a (backend,
+    # display_name) so any tagged duplicate keeps the tag column populated for
+    # all of the listed rows.
+    tags_by_key: dict[tuple[str, str], set[str]] = {}
+    for agg in conn.execute(
+        "SELECT backend, display_name, tags FROM models WHERE tags IS NOT NULL AND tags != ''"
+    ).fetchall():
+        key = (agg["backend"], agg["display_name"])
+        raw = agg["tags"]
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = [raw]
+        tags_by_key.setdefault(key, set()).update(str(t) for t in parsed)
     conn.close()
-    return [dict(r) for r in rows]
+
+    result = [dict(r) for r in rows]
+    for r in result:
+        union = sorted(tags_by_key.get((r["backend"], r["display_name"]), set()))
+        if union:
+            r["tags"] = json.dumps(union)
+
+    return result
 
 
 def engine_show(config: dict | None = None, name: str | None = None) -> dict:
@@ -2474,16 +2627,19 @@ def engine_pull(
             token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
             civitai_token = os.environ.get(token_env)
 
+            _dm_host = re.search(_CIVITAI_DOMAIN_RE, ref)
+            _civitai_host = _dm_host.group(0) if _dm_host else "civitai.com"
+
             civitai_version_id = parse_civitai_version_id(ref)
             _civitai_model_id = parse_civitai_model_id(ref)
+            air = parse_air_tag(ref)
+            air_file_id = air["file_id"] if air else None
 
             # Browse URL with model ID but no version ID → resolve via API
             if civitai_version_id is None and _civitai_model_id:
-                _dm = re.search(_CIVITAI_DOMAIN_RE, ref)
-                _host = _dm.group(0) if _dm else "civitai.com"
                 _log(log, f"Fetching model info from CivitAI API (model {_civitai_model_id})...")
                 civitai_version_id, _api_subdir = fetch_civitai_model_info(
-                    _civitai_model_id, token=civitai_token, host=_host
+                    _civitai_model_id, token=civitai_token, host=_civitai_host
                 )
                 if civitai_version_id:
                     _log(log, f"  Using latest version {civitai_version_id}")
@@ -2491,12 +2647,33 @@ def engine_pull(
                     subdir = _api_subdir
                     _log(log, f"  Auto-detected subdir {subdir} from CivitAI model type")
 
+            # Version details: exact file list (fileId), base model, trigger words
+            version_info = None
+            selected_file = None
+            if civitai_version_id:
+                version_info = fetch_civitai_version_info(
+                    civitai_version_id, token=civitai_token, host=_civitai_host
+                )
+                if version_info:
+                    if air_file_id:
+                        selected_file = next(
+                            (f for f in version_info["files"] if f["id"] == air_file_id), None
+                        )
+                    else:
+                        selected_file = next(
+                            (f for f in version_info["files"] if f.get("primary")), None
+                        ) or (version_info["files"][0] if version_info["files"] else None)
+
             if not subdir:
                 air = parse_air_tag(ref)
                 if air:
-                    subdir = AIR_TYPE_TO_SUBDIR.get(air["type"])
+                    subdir = comfyui_subdir_for_type(air["type"])
                     if subdir:
                         _log(log, f"  Auto-detected subdir {subdir} from AIR type '{air['type']}'")
+            if not subdir and selected_file:
+                subdir = comfyui_subdir_for_type(selected_file["type"])
+                if subdir:
+                    _log(log, f"  Auto-detected subdir {subdir} from CivitAI file type '{selected_file['type']}'")
             if not subdir:
                 raise MrError("subdir is required for ComfyUI downloads (e.g. checkpoints, loras, vae)")
 
@@ -2505,8 +2682,6 @@ def engine_pull(
 
             if civitai_version_id:
                 # ── CivitAI download ─────────────────────────────────────────
-                _dm = re.search(_CIVITAI_DOMAIN_RE, ref)
-                _civitai_host = _dm.group(0) if _dm else "civitai.com"
                 download_url = f"https://{_civitai_host}/api/download/models/{civitai_version_id}"
                 params = {}
                 if civitai_token:
@@ -2514,6 +2689,13 @@ def engine_pull(
                 else:
                     _log(log, "Warning: No CivitAI API key found. Download may fail for gated models.")
 
+                # Pin the download to the exact file when the tag specifies one
+                # (AIR suffix '+<fileId>'); without it CivitAI serves the default
+                # (primary) file, which may not be the requested variant.
+                file_params = civitai_file_download_params(version_info, air_file_id)
+                if file_params:
+                    params.update(file_params)
+                    _log(log, f"  Requesting exact file id {air_file_id} from the AIR tag")
                 _log(log, f"Downloading from CivitAI (version {civitai_version_id})...")
                 resp = requests.get(download_url, params=params, stream=True, timeout=(30, None))
                 if resp.status_code == 401:
@@ -2524,6 +2706,8 @@ def engine_pull(
                 cd = resp.headers.get("Content-Disposition", "")
                 filename_match = re.search(r'filename="?([^";\r\n]+)"?', cd)
                 out_filename = _sanitize_filename(filename_match.group(1)) if filename_match else ""
+                if not out_filename and selected_file and selected_file.get("name"):
+                    out_filename = _sanitize_filename(selected_file["name"])
                 if not out_filename:
                     out_filename = _sanitize_filename(filename or "")
                 if not out_filename:
@@ -2550,6 +2734,14 @@ def engine_pull(
                 air = parse_air_tag(ref)
                 civitai_url = civitai_source_url(ref, civitai_version_id, air["model_id"] if air else None)
 
+                # Store CivitAI metadata (trigger words / base model) on pull so
+                # `mr show` can display them without a separate enrich step.
+                base_model_val = version_info["base_model"] if version_info else None
+                trigger_words_val = (
+                    json.dumps(version_info["trigger_words"])
+                    if version_info and version_info["trigger_words"] else None
+                )
+
                 existing_by_path = conn.execute(
                     "SELECT * FROM models WHERE file_path=?", (fpath,)
                 ).fetchone()
@@ -2561,20 +2753,23 @@ def engine_pull(
                            SET currently_local=1, times_downloaded=times_downloaded+1,
                                file_path=?, size_gb=?, last_used=?, last_updated=?,
                                source_type='comfyui_civitai', source_url=?,
+                               base_model=COALESCE(?, base_model),
+                               trigger_words=COALESCE(?, trigger_words),
                                status=CASE WHEN status='deleted' THEN NULL ELSE status END
                            WHERE id=?""",
-                        (fpath, size_gb, now, now, civitai_url, row_to_update["id"]),
+                        (fpath, size_gb, now, now, civitai_url,
+                         base_model_val, trigger_words_val, row_to_update["id"]),
                     )
                     mid = row_to_update["id"]
                 else:
                     conn.execute(
                         """INSERT INTO models
                            (display_name, variant, backend, source_type, source_url,
-                            file_path, size_gb, currently_local, times_downloaded,
-                            first_seen, last_used, last_updated)
-                           VALUES (?,?,?,?,?,?,?,1,1,?,?,?)""",
+                            file_path, size_gb, base_model, trigger_words,
+                            currently_local, times_downloaded, first_seen, last_used, last_updated)
+                           VALUES (?,?,?,?,?,?,?,?,?,1,1,?,?,?)""",
                         (local_path.stem, subdir, "comfyui", "comfyui_civitai", civitai_url,
-                         fpath, size_gb, now, now, now),
+                         fpath, size_gb, base_model_val, trigger_words_val, now, now, now),
                     )
                     mid = _last_id(conn)
 
