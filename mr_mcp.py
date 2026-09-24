@@ -187,6 +187,7 @@ def build_write_tools(mcp: MCPServer) -> None:
         download_all: bool = False,
         filename: str | None = None,
         allow_blacklisted: bool = False,
+        enrich_filename: bool = False,
         confirm: bool = True,
     ) -> dict:
         """Pull/download a model. Downloads files to disk and may create registry
@@ -198,12 +199,15 @@ def build_write_tools(mcp: MCPServer) -> None:
         backend auto-detects (ollama by default). For llama.cpp backends pass
         e.g. backend='llamacpp' and optionally variant/file_pattern. For ComfyUI
         pass backend='comfyui' and subdir='checkpoints'|'loras'|'vae'|...
+        enrich_filename: for CivitAI ComfyUI pulls, save the file under a
+        metadata-enriched name (name + version + base model + fp + civitai id).
         """
         return _with_log(
             mr_core.engine_pull,
             ref=ref, backend=backend, variant=variant, file_pattern=file_pattern,
             subdir=subdir, download_all=download_all, filename=filename,
-            allow_blacklisted=allow_blacklisted, confirm=confirm,
+            allow_blacklisted=allow_blacklisted, enrich_filename=enrich_filename,
+            confirm=confirm,
         )
 
     @mcp.tool()
@@ -229,8 +233,10 @@ def build_write_tools(mcp: MCPServer) -> None:
 
     @mcp.tool()
     def mr_rename(name: str, new_name: str, confirm: bool = True) -> dict:
-        """Rename the on-disk directory containing a model (file name and registry
-        display_name stay the same). DESTRUCTIVE; pass confirm=True.
+        """Rename a model on disk. For llama.cpp-style backends, renames the
+        directory (file name unchanged). For ComfyUI, renames the FILE in place
+        and enriches it with CivitAI metadata (version, base model, fp, civitai
+        id) when known. DESTRUCTIVE; pass confirm=True.
         """
         return _call(mr_core.engine_rename, name=name, new_name=new_name, confirm=confirm)
 

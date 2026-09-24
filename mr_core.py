@@ -841,6 +841,10 @@ def fetch_civitai_version_info(
     Returns a dict with:
       base_model:      baseModel string (e.g. 'Krea 2' / 'SDXL 1.0') or None
       trigger_words:   list[str] of trained trigger words (may be empty)
+      model_id:        CivitAI model id
+      model_name:      CivitAI model display name (e.g. 'CyberRealistic Krea 2')
+      version_id:      version id
+      version_name:    version label (e.g. 'v3.0')
       files:           list of dicts with id/name/type/(fp,format)/primary/download_url
     Returns None on network/API failure (callers should fall back to defaults).
     """
@@ -867,11 +871,46 @@ def fetch_civitai_version_info(
             "primary": bool(f.get("primary")),
             "download_url": f.get("downloadUrl"),
         })
+    model = data.get("model") or {}
     return {
         "base_model": data.get("baseModel"),
         "trigger_words": data.get("trainedWords") or [],
+        "model_id": str(model.get("id") or data.get("modelId") or ""),
+        "model_name": model.get("name"),
+        "version_id": str(version_id),
+        "version_name": data.get("name"),
         "files": files,
     }
+
+
+def civitai_metadata_filename(
+    stem: str,
+    version_info: dict | None,
+    selected_file: dict | None = None,
+    model_id: str | None = None,
+) -> str:
+    """Return an enriched file stem for a ComfyUI CivitAI model.
+
+    Appends only the metadata tokens that are actually known, in the form
+    {stem}_{v{version}}_{baseModel}_{fp}_civitai-{modelId}, so files are easier
+    to identify on disk while still traceable back to the CivitAI page.
+    """
+    tokens = []
+    if version_info:
+        vname = version_info.get("version_name") or ""
+        vtoken = re.sub(r"[^A-Za-z0-9.]+", "", vname) or version_info.get("version_id") or ""
+        if vtoken:
+            tokens.append(f"v{vtoken}" if not vtoken.lower().startswith("v") else vtoken)
+    if version_info and version_info.get("base_model"):
+        tokens.append(re.sub(r"[^A-Za-z0-9]+", "", version_info["base_model"]))
+    if selected_file and selected_file.get("fp"):
+        tokens.append(re.sub(r"[^A-Za-z0-9]+", "", selected_file["fp"]))
+    if model_id:
+        tokens.append(f"civitai-{model_id}")
+    if not tokens:
+        return _sanitize_filename(stem).strip("._") or _sanitize_filename(stem)
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", _sanitize_filename(stem)).strip("._") or "model"
+    return f"{slug}_{'_'.join(tokens)}"
 
 
 def civitai_file_download_params(version_info, file_id) -> dict:
@@ -2215,7 +2254,13 @@ def engine_rename(
     new_name: str | None = None,
     confirm: bool = False,
 ) -> dict:
-    """Rename the directory containing a model, keeping the file name unchanged."""
+    """Rename a model on disk.
+
+    llama.cpp-style backends: renames the directory containing the model,
+    keeping the file name unchanged. ComfyUI: renames the *file* in place (the
+    subdir must stay put) and enriches the new name with CivitAI metadata
+    (version, base model, precision, civitai id) when available.
+    """
     _require_writes()
     _require_confirm(confirm)
     if config is None:
@@ -2236,30 +2281,68 @@ def engine_rename(
 
         old_path = Path(row["file_path"])
         old_dir = old_path.parent
-        new_dir = old_dir.with_name(new_name)
 
         if not old_dir.exists():
             raise MrError(f"Directory not found on disk: {old_dir}")
-        if new_dir.exists():
-            raise MrError(f"Directory already exists: {new_dir}")
+        if not old_path.exists():
+            raise MrError(f"File not found on disk: {old_path}")
 
-        old_dir.rename(new_dir)
+        new_name = _sanitize_filename(new_name)
+        if row["backend"] == "comfyui":
+            # ── ComfyUI: rename the file in place, enriched with metadata ──
+            version_info = None
+            selected_file = None
+            model_id = None
+            if row["source_type"] == "comfyui_civitai" and row["source_url"]:
+                air = parse_air_tag(row["source_url"])
+                model_id = air["model_id"] if air else None
+                civitai_version_id = parse_civitai_version_id(row["source_url"])
+                if civitai_version_id:
+                    civitai_cfg = config.get("civitai", {})
+                    token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
+                    civitai_token = os.environ.get(token_env)
+                    version_info = fetch_civitai_version_info(
+                        civitai_version_id, token=civitai_token,
+                        host=(re.search(_CIVITAI_DOMAIN_RE, row["source_url"]).group(0)
+                              if re.search(_CIVITAI_DOMAIN_RE, row["source_url"]) else "civitai.com"),
+                    )
+                    if version_info and air and air.get("file_id"):
+                        selected_file = next(
+                            (f for f in version_info["files"] if f["id"] == air["file_id"]), None
+                        )
+            new_stem = civitai_metadata_filename(new_name, version_info, selected_file, model_id) \
+                if row["source_type"] == "comfyui_civitai" else new_name
+            new_path = old_dir / f"{new_stem}{old_path.suffix}"
+            if new_path == old_path:
+                display_name = old_path.stem
+            else:
+                if new_path.exists():
+                    raise MrError(f"File already exists: {new_path}")
+                old_path.rename(new_path)
+                display_name = new_path.stem
+        else:
+            # ── llama-style: rename the directory, keep the file name ──
+            new_dir = old_dir.with_name(new_name)
+            if new_dir.exists():
+                raise MrError(f"Directory already exists: {new_dir}")
+            old_dir.rename(new_dir)
+            new_path = new_dir / old_path.name
+            display_name = new_path.stem
 
-        new_path = new_dir / old_path.name
         conn.execute(
-            "UPDATE models SET file_path=?, last_updated=? WHERE id=?",
-            (str(new_path), now, row["id"]),
+            "UPDATE models SET file_path=?, display_name=?, last_updated=? WHERE id=?",
+            (str(new_path), display_name, now, row["id"]),
         )
         conn.execute(
             "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
-            (row["id"], "rename", now, f"{old_dir.name} → {new_dir.name}"),
+            (row["id"], "rename", now, json.dumps({"old": str(old_path), "new": str(new_path)})),
         )
         conn.commit()
         return {
             "status": "renamed",
-            "display_name": row["display_name"],
-            "old_dir": str(old_dir),
-            "new_dir": str(new_dir),
+            "display_name": display_name,
+            "old_path": str(old_path),
+            "new_path": str(new_path),
             "timestamp": now,
         }
     finally:
@@ -2359,6 +2442,7 @@ def engine_pull(
     download_all: bool = False,
     filename: str | None = None,
     allow_blacklisted: bool = False,
+    enrich_filename: bool = False,
     confirm: bool = False,
     log: list[str] | None = None,
     progress_callback=None,
@@ -2714,6 +2798,27 @@ def engine_pull(
                     out_filename = f"civitai_{civitai_version_id}.bin"
 
                 local_path = dest_dir / out_filename
+
+                # Optional metadata-enriched filename (name + version + base
+                # model + fp + civitai id) so downloaded files are easy to pick
+                # out in ComfyUI and traceable back to the CivitAI page.
+                if enrich_filename and version_info:
+                    base_stem = version_info.get("model_name") or Path(out_filename).stem
+                    model_id_for_name = (
+                        (air.get("model_id") if air else None) or version_info.get("model_id") or None
+                    )
+                    enriched_stem = civitai_metadata_filename(
+                        base_stem, version_info, selected_file, model_id_for_name
+                    )
+                    enriched_name = f"{enriched_stem}{Path(out_filename).suffix or '.safetensors'}"
+                    if enriched_name != out_filename:
+                        target_path = dest_dir / enriched_name
+                        if target_path.exists():
+                            _log(log, f"  {enriched_name} already exists — keeping {out_filename}")
+                        else:
+                            out_filename = enriched_name
+                            local_path = target_path
+                            _log(log, f"  Saving as {enriched_name}")
 
                 total = int(resp.headers.get("Content-Length", 0)) or None
                 downloaded = 0

@@ -258,7 +258,7 @@ def init():
     comfyui_base_dir = ""
     if comfyui_enabled:
         default_comfy = defaults.get("backends", {}).get("comfyui", {}).get(
-            "base_dir", r"M:\Programs\ComfyUI\ComfyUI\models"
+            "base_dir", r"X:\Models\comfy"
         )
         comfyui_base_dir = click.prompt("ComfyUI models base directory", default=default_comfy)
         p = Path(comfyui_base_dir)
@@ -618,7 +618,9 @@ def enrich(enrich_all):
 @click.option("--backend", type=str, default=None)
 @click.option("--file", "file_pattern", default=None, help="Glob pattern for file in HF repo")
 @click.option("--subdir", default=None, help="ComfyUI subdir to save into (e.g. checkpoints, loras)")
-def pull(ref, variant, backend, file_pattern, subdir):
+@click.option("--rename", "enrich_filename", is_flag=True, default=False,
+              help="CivitAI ComfyUI pulls: save under a metadata-enriched name (name + version + base model + fp + civitai id)")
+def pull(ref, variant, backend, file_pattern, subdir, enrich_filename):
     """Pull a model. Warns if blacklisted or previously deleted.
 
     For ComfyUI models, --subdir is required. Supports HuggingFace repos
@@ -662,6 +664,7 @@ def pull(ref, variant, backend, file_pattern, subdir):
                 download_all=overrides.get("download_all", False),
                 filename=overrides.get("filename", None),
                 allow_blacklisted=overrides.get("allow_blacklisted", False),
+                enrich_filename=overrides.get("enrich_filename", enrich_filename),
                 confirm=True,
                 log=log,
                 progress_callback=_cb,
@@ -865,17 +868,23 @@ def copy(src_backend, dst_backend, model_name):
 @click.argument("model")
 @click.argument("new_name")
 def rename(model, new_name):
-    """Rename the directory containing a model, keeping the file name unchanged."""
+    """Rename a model on disk.
+
+    For llamacpp-style backends, renames the directory (keeping the file name
+    unchanged). For ComfyUI, renames the FILE in place (the subdir stays put)
+    and enriches the new name with CivitAI metadata when available.
+    """
     config = load_config()
     row = resolve_model_interactive(config, model)
     try:
         result = mr_core.engine_rename(config, name=row["display_name"], new_name=new_name, confirm=True)
     except (MrError, DestructiveOperation) as e:
-        if "No file_path" in str(e) or "Directory not found" in str(e):
+        if "not found on disk" in str(e):
             console.print(f"[yellow]{e}[/yellow]")
             return
         sys.exit(_handle_engine_error(e))
-    console.print(f"[green]✓ Renamed directory: {result['old_dir']} → {result['new_dir']}[/green]")
+    kind = "Renamed file" if row["backend"] == "comfyui" else "Renamed directory"
+    console.print(f"[green]✓ {kind}: {result['old_path']} → {result['new_path']}[/green]")
 
 
 # ─── delete / remove / blacklist ──────────────────────────────────────────────
