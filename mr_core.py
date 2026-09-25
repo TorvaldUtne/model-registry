@@ -1047,7 +1047,141 @@ def scan_comfyui(config: dict, conn: sqlite3.Connection) -> tuple[int, int]:
             (now,),
         )
 
-    return added, updated
+    removed = _consolidate_comfyui_duplicates(conn, now)
+    return added, updated, removed
+
+
+def _consolidate_comfyui_duplicates(conn: sqlite3.Connection, now: str) -> int:
+    """Merge duplicate comfyui rows that track the same file under different paths.
+
+    The comfyui scan keys rows by exact file_path, so when a file moves drives
+    (or gets pulled once per location) the same model ends up as several rows —
+    one live copy plus stale duplicates. Group by (display_name, subdir) and:
+
+      - exactly one live row  → the live row is the keeper; absorb missing
+        metadata (civitai/hf source, base model, trigger words, tags, rating,
+        notes) from every duplicate, then delete the duplicates.
+      - no live row          → keep the row whose file still exists on disk (or
+        the most recently updated), delete only duplicates whose file exists
+        nowhere.
+      - several live rows    → ambiguous; leave untouched.
+
+    Returns the number of duplicate rows removed.
+    """
+    rows = conn.execute(
+        "SELECT * FROM models WHERE backend='comfyui'"
+    ).fetchall()
+
+    groups: dict[tuple[str, str | None], list[sqlite3.Row]] = {}
+    for r in rows:
+        groups.setdefault((r["display_name"], r["variant"]), []).append(r)
+
+    removed = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        local = [r for r in members if r["currently_local"]]
+        if len(local) == 1:
+            keeper = local[0]
+            donors = [r for r in members if r is not keeper]
+        elif len(local) == 0:
+            on_disk = [
+                r for r in members
+                if r["file_path"] and Path(r["file_path"]).exists()
+            ]
+            keeper = (
+                on_disk[0] if on_disk
+                else max(members, key=lambda r: r["last_updated"] or "")
+            )
+            donors = []
+            for r in members:
+                if r is keeper:
+                    continue
+                still_exists = r["file_path"] and Path(r["file_path"]).exists()
+                if not still_exists:
+                    donors.append(r)
+        else:
+            continue
+
+        if not donors:
+            continue
+        for donor in donors:
+            merged = _absorb_comfyui_row(conn, keeper, donor, now)
+            donor_id = donor["id"]
+            conn.execute(
+                "UPDATE events SET model_id=? WHERE model_id=?", (keeper["id"], donor_id)
+            )
+            conn.execute("DELETE FROM models WHERE id=?", (donor_id,))
+            conn.execute(
+                "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                (
+                    keeper["id"], "scan_merged", now,
+                    json.dumps({"absorbed_id": donor_id, "fields": merged}),
+                ),
+            )
+            removed += 1
+    if removed:
+        conn.commit()
+    return removed
+
+
+def _absorb_comfyui_row(
+    conn: sqlite3.Connection,
+    keeper: sqlite3.Row,
+    donor: sqlite3.Row,
+    now: str,
+) -> list[str]:
+    """Copy a duplicate row's missing metadata into the keeper. Returns changed fields."""
+    changes: dict[str, object] = {}
+
+    for col in ("source_url", "base_model", "trigger_words", "hf_repo"):
+        if not keeper[col] and donor[col]:
+            changes[col] = donor[col]
+
+    # Upgrade an "unknown" row to the donor's proper provenance when the donor
+    # carries a CivitAI/HF source tag (otherwise enrich/rename would skip it).
+    if (
+        (keeper["source_type"] in (None, "comfyui_unknown"))
+        and donor["source_type"] in ("comfyui_civitai", "comfyui_hf")
+    ):
+        changes["source_type"] = donor["source_type"]
+
+    if donor["tags"]:
+        ktags: set[str] = set()
+        if keeper["tags"]:
+            try:
+                ktags = {str(t) for t in json.loads(keeper["tags"])}
+            except json.JSONDecodeError:
+                ktags = {str(keeper["tags"])}
+        donor_tags: set[str] = set()
+        try:
+            donor_tags = {str(t) for t in json.loads(donor["tags"])}
+        except json.JSONDecodeError:
+            donor_tags = {str(donor["tags"])}
+        merged_tags = ktags | donor_tags
+        new_tags = json.dumps(sorted(merged_tags))
+        if new_tags != keeper["tags"]:
+            changes["tags"] = new_tags
+
+    for col in ("rating", "notes"):
+        if keeper[col] is None and donor[col] is not None:
+            changes[col] = donor[col]
+
+    if donor["times_downloaded"]:
+        changes["times_downloaded"] = (keeper["times_downloaded"] or 0) + donor["times_downloaded"]
+    if donor["first_seen"] and (not keeper["first_seen"] or donor["first_seen"] < keeper["first_seen"]):
+        changes["first_seen"] = donor["first_seen"]
+    if donor["last_used"] and (not keeper["last_used"] or donor["last_used"] > keeper["last_used"]):
+        changes["last_used"] = donor["last_used"]
+
+    if changes:
+        changes["last_updated"] = now
+        set_clauses = [f"{c}=?" for c in changes]
+        conn.execute(
+            f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
+            [*changes.values(), keeper["id"]],
+        )
+    return list(changes.keys())
 
 
 # ─── File deletion (shared by delete/blacklist) ───────────────────────────────
@@ -1602,10 +1736,12 @@ def engine_scan(
     if comfy_cfg.get("enabled", False):
         base_dir = comfy_cfg.get("base_dir", "")
         _log(log, f"\nScanning ComfyUI models in {base_dir}...")
-        c_added, c_updated = scan_comfyui(config, conn)
+        c_added, c_updated, c_merged = scan_comfyui(config, conn)
         added += c_added
         updated += c_updated
         _log(log, f"  ComfyUI: {c_added} added, {c_updated} updated")
+        if c_merged:
+            _log(log, f"  ComfyUI: merged {c_merged} duplicate row(s) into their live counterparts")
 
     conn.commit()
     conn.close()
@@ -2278,6 +2414,30 @@ def engine_rename(
             raise MrError("Ollama models don't have directories to rename.")
         if not row["file_path"]:
             raise MrError("No file_path recorded for this model - cannot rename on disk.")
+
+        # If the resolved record points at a file that isn't on disk (stale
+        # path left behind when the file moved/copied), fall back to a sibling
+        # record with the same display_name whose file is actually on disk.
+        # This keeps rename tracking the live file instead of failing on a
+        # stale row.
+        if not Path(row["file_path"]).exists():
+            siblings = [
+                r
+                for r in conn.execute(
+                    """SELECT * FROM models
+                       WHERE display_name = ? AND id != ?
+                         AND file_path IS NOT NULL AND file_path != ''""",
+                    (row["display_name"], row["id"]),
+                ).fetchall()
+                if Path(r["file_path"]).exists()
+            ]
+            if len(siblings) == 1:
+                row = siblings[0]
+            elif len(siblings) > 1:
+                raise AmbiguousModel(
+                    row["display_name"],
+                    [dict(r) for r in siblings],
+                )
 
         old_path = Path(row["file_path"])
         old_dir = old_path.parent

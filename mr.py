@@ -12,6 +12,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
+
 import click
 from rich import box
 from rich.console import Console
