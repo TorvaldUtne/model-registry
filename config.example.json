@@ -30,6 +30,7 @@
   "mcp": {
     "host": "0.0.0.0",
     "port": 8321,
-    "mode": "readonly"
+    "mode": "readonly",
+    "stateful": false
   }
 }

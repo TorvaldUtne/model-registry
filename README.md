@@ -119,7 +119,8 @@ python mr.py report
   "mcp": {
     "host": "0.0.0.0",
     "port": 8321,
-    "mode": "readonly"
+    "mode": "readonly",
+    "stateful": false
   }
 }
 ```
@@ -130,7 +131,8 @@ Set `registry_db` to an absolute path to store the database somewhere other than
 "mcp": {
   "host": "0.0.0.0",
   "port": 8321,
-  "mode": "readonly"
+  "mode": "readonly",
+  "stateful": false
 }
 ```
 
@@ -145,6 +147,7 @@ mr-serve.bat --read-write        # same via launcher
 ```
 
 - Endpoint: `http://<host>:8321/mcp`
+- **Stateless by default**: the Streamable HTTP transport mints no session id and ignores any `mcp-session-id` header, so a client that cached a session id from a previous run (or after the 30-minute idle expiry) can never hit a hard `404`. These tools are pure request/response, so nothing depends on session state. Pass `--stateful` (or set `"stateful": true` in the `mcp` config) to opt back into stateful sessions if a client needs resumability or server-initiated requests.
 - **Read-only by default**: exposes `mr_list`, `mr_show`, `mr_report`, `mr_search`, `mr_backends` only.
 - **Read-write** (`--read-write` or `"mode": "readwrite"`) additionally exposes `mr_scan`, `mr_enrich`, `mr_rate`, `mr_status`, `mr_note`, `mr_touch`, `mr_tag`, `mr_untag`, `mr_pull`, `mr_delete`, `mr_remove`, `mr_removeall`, `mr_rename`, `mr_copy`, `mr_blacklist`, `mr_restore`.
 - **Destructive tools** (`pull`, `delete`, `remove`, `removeall`, `rename`, `copy`, `blacklist`, `restore`) require `confirm=True` in the call, so an agent always states intent explicitly.

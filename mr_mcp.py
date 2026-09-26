@@ -303,6 +303,13 @@ def main() -> None:
     )
     parser.add_argument("--host", default=None, help="Interface to bind (default 0.0.0.0)")
     parser.add_argument("--port", type=int, default=None, help="Port to bind (default 8321)")
+    parser.add_argument(
+        "--stateful", action="store_true", default=False,
+        help="Use stateful HTTP sessions. Default is stateless, so a cached/stale "
+             "session id can never cause an HTTP 404 (the server ignores the header "
+             "and mints no session). Enable only if a client needs resumability or "
+             "server-initiated requests.",
+    )
     args = parser.parse_args()
 
     # Mode: CLI --read-write or config mcp.mode; --readonly always wins
@@ -318,6 +325,13 @@ def main() -> None:
 
     host = args.host or mcp_cfg.get("host", "0.0.0.0")
     port = args.port or int(mcp_cfg.get("port", 8321))
+
+    # Stateless by default: the Streamable HTTP transport then ignores any
+    # session-id header and mints none of its own, so a client that cached a
+    # session id from a previous server run (or after the 30-minute idle
+    # expiry) is served normally instead of getting a hard 404. These tools are
+    # pure request/response, so nothing here relies on session state.
+    stateless = not (args.stateful or mcp_cfg.get("stateful", False))
 
     name = "model-registry"
     mcp = MCPServer(
@@ -338,6 +352,7 @@ description=(
     print(f"Model Registry MCP server starting", file=sys.stderr)
     print(f"  URL:    http://{host}:{port}/mcp", file=sys.stderr)
     print(f"  Mode:   {'READ-WRITE' if readwrite else 'READ-ONLY'}", file=sys.stderr)
+    print(f"  Session:{'stateless (no session id required)' if stateless else 'stateful'}", file=sys.stderr)
     print("  Tools:  reads + writes" if readwrite else "  Tools:  reads only", file=sys.stderr)
     print("  NOTE:   No authentication - trusted local network only.", file=sys.stderr)
 
@@ -346,6 +361,7 @@ description=(
             transport="streamable-http",
             host=host,
             port=port,
+            stateless_http=stateless,
         )
     except KeyboardInterrupt:
         pass
