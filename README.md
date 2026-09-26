@@ -110,7 +110,9 @@ python mr.py report
     "token_env_var": "HF_TOKEN"
   },
   "civitai": {
-    "token_env_var": "CIVITAI_API_KEY"
+    "token_env_var": "CIVITAI_API_KEY",
+    "web_host": "civitai.green",
+    "api_host": "civitai.com"
   },
   "display": {
     "date_format": "%Y-%m-%d",
@@ -125,7 +127,11 @@ python mr.py report
 }
 ```
 
-Set `registry_db` to an absolute path to store the database somewhere other than the script directory. Leave blank to use `registry.db` next to `mr.py`. The optional `mcp` section configures the MCP server:
+Set `registry_db` to an absolute path to store the database somewhere other than the script directory. Leave blank to use `registry.db` next to `mr.py`.
+
+CivitAI split its web frontend: `civitai.green` (SFW only) and `civitai.red` (includes NSFW); `civitai.com` is legacy for browsing. `civitai.web_host` controls the browse links shown by `mr show` (default `civitai.green`); `civitai.api_host` controls API calls (default `civitai.com`).
+
+The optional `mcp` section configures the MCP server:
 
 ```json
 "mcp": {
@@ -187,7 +193,7 @@ export CIVITAI_API_KEY=...      # CivitAI (required for gated models)
 | `backends` | List configured backend names with their status. |
 | `copy SRC_BACKEND DST_BACKEND MODEL_NAME` | Copy a model from one backend to another. |
 | `blacklist MODEL [REASON]` | Blacklist and auto-delete a model. Future pulls warn before proceeding. |
-| `enrich` | Fetch HuggingFace and CivitAI metadata for all registered models. |
+| `enrich` | Fetch HuggingFace and CivitAI metadata for all registered models. Unenriched ComfyUI files are also matched on CivitAI by SHA-256 hash. |
 | `search TERM` | Search registry by name, HF repo, notes, or tags. |
 
 ### `list` options
@@ -278,6 +284,12 @@ Run mr --help for available commands.
 MIT — see [LICENSE](LICENSE).
 
 ## Changelog
+
+### Unreleased
+- `mr enrich` now matches unenriched ComfyUI files on CivitAI by SHA-256 hash, backfilling provenance (`source_url`/`source_type`), base model, and trigger words. Add new `file_hash`/`hash_checked` columns (unmatched files are cached to avoid re-lookups; `--all` re-checks).
+- CivitAI browse links are configurable: `civitai.web_host` (default `civitai.green`; `civitai.red` includes NSFW) and `civitai.api_host` (default `civitai.com`).
+- `mr rename` / model resolution now tolerate a filename passed with its extension (`foo.safetensors` → `foo`).
+- `mr pull --backend comfyui` auto-detects the ComfyUI subdir from the repo file path (e.g. `loras/foo.safetensors`, `text_encoders/...`) and no longer nests `models/loras/loras/foo`; meaningful extra folders (e.g. `loras/author/foo`) are preserved.
 
 ### v1.4.0
 - New architecture: engine extracted to `mr_core.py`; `mr.py` is the CLI; added `mr_mcp.py`, an MCP (Streamable HTTP) server for agent access over the LAN.

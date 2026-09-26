@@ -12,6 +12,7 @@ require an explicit `confirm=True` argument.
 
 import difflib
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -42,12 +43,17 @@ class MrError(Exception):
 class ModelNotFound(MrError):
     """Model not found in registry."""
 
-    def __init__(self, name: str, suggestions: list[str] | None = None):
+    def __init__(self, name: str, suggestions: list[str] | None = None, hint: str | None = None):
         self.name = name
         self.suggestions = suggestions or []
-        super().__init__(
-            f"Model '{name}' not found", {"suggestions": self.suggestions}
-        )
+        self.hint = hint
+        message = f"Model '{name}' not found"
+        if hint:
+            message += f" ({hint})"
+        details = {"suggestions": self.suggestions}
+        if hint:
+            details["hint"] = hint
+        super().__init__(message, details)
 
 
 class AmbiguousModel(MrError):
@@ -119,6 +125,29 @@ CONFIG_FILE = SCRIPT_DIR / "config.json"
 CONFIG_EXAMPLE = SCRIPT_DIR / "config.example.json"
 
 _CIVITAI_DOMAIN_RE = r"civitai\.(?:com|green|red)"
+
+# Shared User-Agent for outbound HTTP. CivitAI (and others) reject requests with
+# the default urllib/requests agent with 403, so always send a stable one.
+_HTTP_HEADERS = {
+    "User-Agent": f"model-registry/{__version__} (+https://github.com/TorvaldUtne/model-registry)"
+}
+
+# CivitAI split its web frontend: green = SFW only, red = includes NSFW.
+# civitai.com is legacy for human browsing. The API still lives on civitai.com.
+CIVITAI_DEFAULT_WEB_HOST = "civitai.green"
+CIVITAI_DEFAULT_API_HOST = "civitai.com"
+
+
+def civitai_web_host(config: dict | None = None) -> str:
+    """Host used for human-facing CivitAI browse URLs (default: civitai.green)."""
+    host = (config or {}).get("civitai", {}).get("web_host")
+    return (host or CIVITAI_DEFAULT_WEB_HOST).strip() or CIVITAI_DEFAULT_WEB_HOST
+
+
+def civitai_api_host(config: dict | None = None) -> str:
+    """Host used for CivitAI API calls (default: civitai.com)."""
+    host = (config or {}).get("civitai", {}).get("api_host")
+    return (host or CIVITAI_DEFAULT_API_HOST).strip() or CIVITAI_DEFAULT_API_HOST
 
 # AIR type field → ComfyUI subdir name
 AIR_TYPE_TO_SUBDIR = {
@@ -221,6 +250,35 @@ def comfyui_subdir_for_type(type_: str | None) -> str | None:
     return None
 
 
+# Canonical ComfyUI subdir names (values of the type→subdir maps above), used to
+# recognize repo-supplied directory prefixes such as 'loras/foo.safetensors'.
+_COMFYUI_SUBDIRS = {
+    v.lower()
+    for table in (AIR_TYPE_TO_SUBDIR, CIVITAI_API_TYPE_TO_SUBDIR, CIVITAI_FILE_TYPE_TO_SUBDIR)
+    for v in table.values()
+}
+
+
+def detect_comfyui_subdir(rel_path: str) -> tuple[str | None, str]:
+    """Detect a ComfyUI subdir inside a repo-relative file path.
+
+    Many HuggingFace repos ship files under a directory named after the ComfyUI
+    type, e.g. 'loras/krea2.safetensors' or 'text_encoders/qwen.safetensors'.
+    Returns (subdir, remainder) using the *last* known subdir segment, so
+    'loras/loras/x' → ('loras', 'x') and
+    'text_encoders/split_files/text_encoders/x' → ('text_encoders', 'x').
+    Returns (None, rel_path) when no known subdir is present.
+    """
+    parts = [p for p in rel_path.replace("\\", "/").split("/") if p]
+    anchor = None
+    for i, part in enumerate(parts[:-1]):  # never treat the file name itself as a dir
+        if part.lower() in _COMFYUI_SUBDIRS:
+            anchor = i
+    if anchor is None:
+        return None, rel_path
+    return parts[anchor].lower(), "/".join(parts[anchor + 1:])
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -231,6 +289,21 @@ def now_iso() -> str:
 def _log(log: list[str] | None, msg: str) -> None:
     if log is not None:
         log.append(msg)
+
+
+def _file_sha256(path: str | Path, chunk_size: int = 1 << 20) -> str | None:
+    """Return the lowercase SHA-256 hex digest of a file, or None if unreadable.
+
+    Streams in chunks so multi-GB checkpoints don't load into memory.
+    """
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -289,7 +362,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             source_url        TEXT,
             base_model        TEXT,
             trigger_words     TEXT,
-            context_window    INTEGER
+            context_window    INTEGER,
+            file_hash         TEXT,
+            hash_checked      TEXT
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -307,6 +382,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         ("base_model",    "TEXT"),
         ("trigger_words", "TEXT"),
         ("context_window", "INTEGER"),
+        ("file_hash",     "TEXT"),
+        ("hash_checked",  "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE models ADD COLUMN {col} {definition}")
@@ -333,6 +410,30 @@ def _scalar(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> int:
 # ─── Model resolution ─────────────────────────────────────────────────────────
 
 
+# Model file extensions users may paste along with a name (e.g. after an `ls`).
+_MODEL_EXTENSIONS = (
+    ".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx", ".sft",
+)
+
+
+def _strip_model_extension(name: str) -> str | None:
+    """Return name without a known model file extension, or None if none present."""
+    lower = name.lower()
+    for ext in _MODEL_EXTENSIONS:
+        if lower.endswith(ext):
+            return name[: -len(ext)]
+    return None
+
+
+def _query_by_name(conn: sqlite3.Connection, name: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT * FROM models
+           WHERE display_name LIKE ? OR ollama_name LIKE ?
+           ORDER BY display_name""",
+        (f"%{name}%", f"%{name}%"),
+    ).fetchall()
+
+
 def resolve_model(conn: sqlite3.Connection, name: str, index: int = 0) -> sqlite3.Row:
     """Return a single models row matching name (partial on display_name/ollama_name).
 
@@ -341,23 +442,31 @@ def resolve_model(conn: sqlite3.Connection, name: str, index: int = 0) -> sqlite
     - Multiple matches and index not provided → raises AmbiguousModel.
     - No matches → raises ModelNotFound with close-match suggestions.
 
+    A trailing model file extension (e.g. '.safetensors') is tolerated: if the
+    raw name matches nothing it is retried without the extension.
+
     Args:
         index: 0-based index to select among ambiguous matches.
     """
-    rows = conn.execute(
-        """SELECT * FROM models
-           WHERE display_name LIKE ? OR ollama_name LIKE ?
-           ORDER BY display_name""",
-        (f"%{name}%", f"%{name}%"),
-    ).fetchall()
+    rows = _query_by_name(conn, name)
+
+    # Tolerate a pasted filename: 'foo.safetensors' → 'foo'.
+    if not rows:
+        stem = _strip_model_extension(name)
+        if stem and stem != name:
+            rows = _query_by_name(conn, stem)
 
     if not rows:
+        search = _strip_model_extension(name) or name
         all_names = [
             r["display_name"]
             for r in conn.execute("SELECT display_name FROM models").fetchall()
         ]
-        suggestions = difflib.get_close_matches(name, all_names, n=5, cutoff=0.4)
-        raise ModelNotFound(name, suggestions)
+        suggestions = difflib.get_close_matches(search, all_names, n=5, cutoff=0.4)
+        hint = None
+        if search != name:
+            hint = f"tried '{search}' without the file extension"
+        raise ModelNotFound(name, suggestions, hint)
 
     if len(rows) == 1:
         return rows[0]
@@ -589,14 +698,29 @@ def parse_variant_from_filename(filename: str) -> str | None:
     return None
 
 
-def flatten_hf_subdir(directory: Path) -> None:
-    """If directory contains exactly one subdirectory, move its contents up and remove it."""
-    subdirs = [d for d in directory.iterdir() if d.is_dir()]
-    if len(subdirs) == 1:
-        subdir = subdirs[0]
-        for item in subdir.iterdir():
-            shutil.move(str(item), str(directory / item.name))
-        subdir.rmdir()
+def place_downloaded_file(local_path: Path, dest_dir: Path, relative_name: str | None = None) -> Path:
+    """Move a hub-downloaded file into dest_dir at relative_name (default: basename).
+
+    HuggingFace honours the repo-relative path, so a file requested as
+    'loras/foo.safetensors' lands in dest_dir/loras/foo.safetensors. When
+    dest_dir already *is* the 'loras' subdir this yields the doubled
+    models/loras/loras/foo.safetensors. Callers pass the path remainder after
+    the ComfyUI-type prefix so the file lands at models/loras/foo.safetensors,
+    and any emptied source directories are pruned.
+    """
+    target = dest_dir / (relative_name or local_path.name)
+    if target == local_path:
+        return local_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(local_path), str(target))
+    parent = local_path.parent
+    while parent != dest_dir and parent.is_dir():
+        try:
+            parent.rmdir()  # fails (and we stop) if not empty
+        except OSError:
+            break
+        parent = parent.parent
+    return target
 
 
 def resolve_local_file_path(file_path: str, config: dict | None = None) -> Path | None:
@@ -820,7 +944,7 @@ def fetch_civitai_model_info(
     if token:
         params["token"] = token
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(url, params=params, headers=_HTTP_HEADERS, timeout=15)
         if resp.status_code != 200:
             return None, None
         data = resp.json()
@@ -833,32 +957,12 @@ def fetch_civitai_model_info(
     return version_id, subdir
 
 
-def fetch_civitai_version_info(
-    version_id, token=None, host="civitai.com"
-) -> dict | None:
-    """Call CivitAI API v1 for a model version.
+def _parse_civitai_version_payload(data: dict) -> dict:
+    """Normalize a CivitAI model-version payload.
 
-    Returns a dict with:
-      base_model:      baseModel string (e.g. 'Krea 2' / 'SDXL 1.0') or None
-      trigger_words:   list[str] of trained trigger words (may be empty)
-      model_id:        CivitAI model id
-      model_name:      CivitAI model display name (e.g. 'CyberRealistic Krea 2')
-      version_id:      version id
-      version_name:    version label (e.g. 'v3.0')
-      files:           list of dicts with id/name/type/(fp,format)/primary/download_url
-    Returns None on network/API failure (callers should fall back to defaults).
+    Both /model-versions/{id} and /model-versions/by-hash/{hash} return the same
+    shape, so parse once here to keep the two lookups in sync.
     """
-    url = f"https://{host}/api/v1/model-versions/{version_id}"
-    params = {}
-    if token:
-        params["token"] = token
-    try:
-        resp = requests.get(url, params=params, timeout=15)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-    except (requests.RequestException, json.JSONDecodeError):
-        return None
     files = []
     for f in data.get("files", []):
         meta = f.get("metadata") or {}
@@ -877,10 +981,68 @@ def fetch_civitai_version_info(
         "trigger_words": data.get("trainedWords") or [],
         "model_id": str(model.get("id") or data.get("modelId") or ""),
         "model_name": model.get("name"),
-        "version_id": str(version_id),
+        "model_type": model.get("type"),
+        "version_id": str(data.get("id") or ""),
         "version_name": data.get("name"),
         "files": files,
     }
+
+
+def fetch_civitai_version_info(
+    version_id, token=None, host="civitai.com"
+) -> dict | None:
+    """Call CivitAI API v1 for a model version.
+
+    Returns a dict with:
+      base_model:      baseModel string (e.g. 'Krea 2' / 'SDXL 1.0') or None
+      trigger_words:   list[str] of trained trigger words (may be empty)
+      model_id:        CivitAI model id
+      model_name:      CivitAI model display name (e.g. 'CyberRealistic Krea 2')
+      model_type:      CivitAI model type (e.g. 'LORA', 'Checkpoint')
+      version_id:      version id
+      version_name:    version label (e.g. 'v3.0')
+      files:           list of dicts with id/name/type/(fp,format)/primary/download_url
+    Returns None on network/API failure (callers should fall back to defaults).
+    """
+    url = f"https://{host}/api/v1/model-versions/{version_id}"
+    params = {}
+    if token:
+        params["token"] = token
+    try:
+        resp = requests.get(url, params=params, headers=_HTTP_HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except (requests.RequestException, json.JSONDecodeError):
+        return None
+    parsed = _parse_civitai_version_payload(data)
+    if not parsed["version_id"]:
+        parsed["version_id"] = str(version_id)
+    return parsed
+
+
+def fetch_civitai_version_by_hash(
+    file_hash, token=None, host="civitai.com"
+) -> dict | None:
+    """Look up a CivitAI model version from a local file's SHA-256 hash.
+
+    Uses GET /api/v1/model-versions/by-hash/{hash}; the query-parameter form
+    returns 400, so the hash must be in the path. Returns the same shape as
+    fetch_civitai_version_info, or None when the hash is unknown/not public or
+    the request fails.
+    """
+    url = f"https://{host}/api/v1/model-versions/by-hash/{file_hash}"
+    params = {}
+    if token:
+        params["token"] = token
+    try:
+        resp = requests.get(url, params=params, headers=_HTTP_HEADERS, timeout=20)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except (requests.RequestException, json.JSONDecodeError):
+        return None
+    return _parse_civitai_version_payload(data)
 
 
 def civitai_metadata_filename(
@@ -927,29 +1089,34 @@ def civitai_file_download_params(version_info, file_id) -> dict:
     return {"fileId": file_id}
 
 
-def civitai_source_url(ref: str, version_id, model_id=None) -> str:
-    """Return the value to store as source_url for a CivitAI download."""
+def civitai_source_url(ref: str, version_id, model_id=None, config: dict | None = None) -> str:
+    """Return the value to store as source_url for a CivitAI download.
+
+    Constructed (non-URL) refs use the configured web host; explicit URLs keep
+    whatever domain the user supplied.
+    """
+    web = civitai_web_host(config)
     if parse_air_tag(ref):
         return ref
-    if model_id:
-        return f"https://civitai.com/models/{model_id}?modelVersionId={version_id}"
     if re.search(_CIVITAI_DOMAIN_RE + r"/models/", ref, re.IGNORECASE):
         m = re.match(
             r"(https://" + _CIVITAI_DOMAIN_RE + r"/models/\d+(?:/[^?#]*)?)",
             ref,
             re.IGNORECASE,
         )
-        base = m.group(1).rstrip("/") if m else "https://civitai.com/models"
+        base = m.group(1).rstrip("/") if m else f"https://{web}/models"
         return f"{base}?modelVersionId={version_id}"
-    return f"https://civitai.com/models?versionId={version_id}"
+    if model_id:
+        return f"https://{web}/models/{model_id}?modelVersionId={version_id}"
+    return f"https://{web}/models?versionId={version_id}"
 
 
-def get_model_link(row) -> str | None:
-    """Get a browse URL for a model row."""
+def get_model_link(row, config: dict | None = None) -> str | None:
+    """Get a browse URL for a model row (AIR tags use the configured web host)."""
     if row["source_url"]:
         air = parse_air_tag(row["source_url"])
         if air:
-            return f"https://civitai.com/models/{air['model_id']}?modelVersionId={air['version_id']}"
+            return f"https://{civitai_web_host(config)}/models/{air['model_id']}?modelVersionId={air['version_id']}"
         return row["source_url"]
     if row["hf_repo"]:
         return f"https://huggingface.co/{row['hf_repo']}"
@@ -1358,7 +1525,7 @@ def engine_show(config: dict | None = None, name: str | None = None) -> dict:
         result["notes_list"] = (
             row["notes"].strip().splitlines() if row["notes"] else []
         )
-        result["link"] = get_model_link(row)
+        result["link"] = get_model_link(row, config)
 
         events = conn.execute(
             "SELECT * FROM events WHERE model_id=? ORDER BY timestamp DESC LIMIT 10",
@@ -1448,7 +1615,7 @@ def engine_search(
 
     results = [dict(r) for r in rows]
     for r in results:
-        r["link"] = get_model_link(r)
+        r["link"] = get_model_link(r, config)
     return results
 
 
@@ -1763,6 +1930,10 @@ def engine_enrich(
     hf_token = os.environ.get(
         config.get("huggingface", {}).get("token_env_var", "")
     ) or None
+    civitai_cfg = config.get("civitai", {})
+    civitai_token = os.environ.get(
+        civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
+    )
 
     where_clause = "WHERE 1=1"
     if not enrich_all:
@@ -1779,11 +1950,33 @@ def engine_enrich(
         ORDER BY display_name
     """).fetchall()
 
-    if not rows:
-        conn.close()
-        return {"updated": 0, "civitai_updated": 0, "timestamp": now}
+    # Local ComfyUI files with no known source: candidates for a SHA-256 lookup.
+    # hash_checked is a negative cache so unmatched files aren't re-queried on
+    # every run; --all clears it and forces a re-check.
+    hash_where = (
+        "WHERE backend='comfyui' AND file_path IS NOT NULL AND source_url IS NULL"
+    )
+    if not enrich_all:
+        hash_where += (
+            " AND currently_local=1 AND hash_checked IS NULL AND "
+            "(status IS NULL OR status NOT IN ('deleted', 'blacklisted'))"
+        )
+    hash_rows = conn.execute(
+        f"SELECT id, display_name, file_path, file_hash, base_model, trigger_words "
+        f"FROM models {hash_where} ORDER BY display_name"
+    ).fetchall()
 
-    _log(log, f"Enriching {len(rows)} model(s) from HuggingFace Hub...")
+    if not rows and not hash_rows:
+        conn.close()
+        return {
+            "updated": 0,
+            "civitai_updated": 0,
+            "civitai_hash_updated": 0,
+            "timestamp": now,
+        }
+
+    if rows:
+        _log(log, f"Enriching {len(rows)} model(s) from HuggingFace Hub...")
 
     updated_count = 0
     for row in rows:
@@ -1830,7 +2023,72 @@ def engine_enrich(
             updated_count += 1
             _log(log, f"  Enriched {row['display_name']}")
 
-    # ── CivitAI enrichment ──────────────────────────────────────────────────
+    # ── CivitAI by-hash enrichment (local files with unknown provenance) ─────
+    hash_updated_count = 0
+    if hash_rows:
+        _log(log, f"Looking up {len(hash_rows)} ComfyUI file(s) by SHA-256...")
+        for row in hash_rows:
+            file_hash = row["file_hash"]
+            if not file_hash:
+                file_hash = _file_sha256(row["file_path"])
+                if not file_hash:
+                    _log(log, f"  Skipping {row['display_name']} (unreadable)")
+                    continue
+                # Persist the hash even on a miss so we only ever hash once.
+                conn.execute(
+                    "UPDATE models SET file_hash=? WHERE id=?", (file_hash, row["id"])
+                )
+
+            info = fetch_civitai_version_by_hash(
+                file_hash, token=civitai_token, host=civitai_api_host(config)
+            )
+            if not info:
+                conn.execute(
+                    "UPDATE models SET hash_checked=? WHERE id=?", (now, row["id"])
+                )
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (row["id"], "enrich_hash_miss", now, json.dumps({"file_hash": file_hash})),
+                )
+                conn.commit()
+                _log(log, f"  No CivitAI match for {row['display_name']}")
+                time.sleep(0.5)
+                continue
+
+            trigger_words = info.get("trigger_words") or []
+            trigger_words_json = json.dumps(trigger_words) if trigger_words else None
+
+            h_updates = {"source_type": "comfyui_civitai", "hash_checked": now}
+            model_id = info.get("model_id")
+            version_id = info.get("version_id")
+            if model_id and version_id:
+                h_updates["source_url"] = (
+                    f"https://{civitai_web_host(config)}/models/{model_id}?modelVersionId={version_id}"
+                )
+            if info.get("base_model") and not row["base_model"]:
+                h_updates["base_model"] = info["base_model"]
+            if trigger_words_json and not row["trigger_words"]:
+                h_updates["trigger_words"] = trigger_words_json
+            h_updates["last_updated"] = now
+
+            set_clauses = [f"{k}=?" for k in h_updates.keys()]
+            query_params = list(h_updates.values()) + [row["id"]]
+            conn.execute(
+                f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
+                query_params,
+            )
+            conn.execute(
+                "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                (row["id"], "enrich_updated", now, json.dumps(h_updates)),
+            )
+            conn.commit()
+            hash_updated_count += 1
+            _log(log, f"  Matched CivitAI by hash: {row['display_name']} -> "
+                      f"{info.get('model_name') or model_id or version_id}")
+
+            time.sleep(0.5)
+
+    # ── CivitAI enrichment (known source URLs) ──────────────────────────────
     civitai_where = "WHERE source_type='comfyui_civitai' AND source_url IS NOT NULL"
     if not enrich_all:
         civitai_where += (
@@ -1843,10 +2101,6 @@ def engine_enrich(
 
     civitai_updated_count = 0
     if civitai_rows:
-        civitai_cfg = config.get("civitai", {})
-        token_env = civitai_cfg.get("token_env_var", "CIVITAI_API_KEY")
-        civitai_token = os.environ.get(token_env)
-
         _log(log, f"Enriching {len(civitai_rows)} CivitAI model(s)...")
 
         for row in civitai_rows:
@@ -1854,10 +2108,10 @@ def engine_enrich(
             if not version_id:
                 continue
 
-            url = f"https://civitai.com/api/v1/model-versions/{version_id}"
+            url = f"https://{civitai_api_host(config)}/api/v1/model-versions/{version_id}"
             params = {"token": civitai_token} if civitai_token else {}
             try:
-                resp = requests.get(url, params=params, timeout=15)
+                resp = requests.get(url, params=params, headers=_HTTP_HEADERS, timeout=15)
                 if resp.status_code != 200:
                     time.sleep(0.5)
                     continue
@@ -1879,10 +2133,10 @@ def engine_enrich(
             if c_updates:
                 c_updates["last_updated"] = now
                 set_clauses = [f"{k}=?" for k in c_updates.keys()]
-                params = list(c_updates.values()) + [row["id"]]
+                update_params = list(c_updates.values()) + [row["id"]]
                 conn.execute(
                     f"UPDATE models SET {', '.join(set_clauses)} WHERE id=?",
-                    params,
+                    update_params,
                 )
                 conn.execute(
                     "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
@@ -1899,6 +2153,7 @@ def engine_enrich(
     return {
         "updated": updated_count,
         "civitai_updated": civitai_updated_count,
+        "civitai_hash_updated": hash_updated_count,
         "timestamp": now,
     }
 
@@ -2464,7 +2719,7 @@ def engine_rename(
                     version_info = fetch_civitai_version_info(
                         civitai_version_id, token=civitai_token,
                         host=(re.search(_CIVITAI_DOMAIN_RE, row["source_url"]).group(0)
-                              if re.search(_CIVITAI_DOMAIN_RE, row["source_url"]) else "civitai.com"),
+                              if re.search(_CIVITAI_DOMAIN_RE, row["source_url"]) else civitai_api_host(config)),
                     )
                     if version_info and air and air.get("file_id"):
                         selected_file = next(
@@ -2872,7 +3127,7 @@ def engine_pull(
             civitai_token = os.environ.get(token_env)
 
             _dm_host = re.search(_CIVITAI_DOMAIN_RE, ref)
-            _civitai_host = _dm_host.group(0) if _dm_host else "civitai.com"
+            _civitai_host = _dm_host.group(0) if _dm_host else civitai_api_host(config)
 
             civitai_version_id = parse_civitai_version_id(ref)
             _civitai_model_id = parse_civitai_model_id(ref)
@@ -2918,11 +3173,23 @@ def engine_pull(
                 subdir = comfyui_subdir_for_type(selected_file["type"])
                 if subdir:
                     _log(log, f"  Auto-detected subdir {subdir} from CivitAI file type '{selected_file['type']}'")
-            if not subdir:
+            # HF downloads: many repos nest files under a ComfyUI-type dir
+            # (e.g. 'loras/foo.safetensors'). Infer the subdir from --file so we
+            # don't prompt and later double it to models/loras/loras/foo.
+            if not subdir and file_pattern:
+                _detected, _ = detect_comfyui_subdir(file_pattern)
+                if _detected:
+                    subdir = _detected
+                    _log(log, f"  Auto-detected subdir {subdir} from --file path")
+
+            # CivitAI needs a subdir up front; HF can still infer it from the
+            # repo's file list (or the resolve URL path) further down.
+            if not subdir and civitai_version_id:
                 raise MrError("subdir is required for ComfyUI downloads (e.g. checkpoints, loras, vae)")
 
-            dest_dir = base_dir / subdir
-            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_dir = base_dir / subdir if subdir else None
+            if dest_dir:
+                dest_dir.mkdir(parents=True, exist_ok=True)
 
             if civitai_version_id:
                 # ── CivitAI download ─────────────────────────────────────────
@@ -2997,7 +3264,7 @@ def engine_pull(
                 fpath = str(local_path)
 
                 air = parse_air_tag(ref)
-                civitai_url = civitai_source_url(ref, civitai_version_id, air["model_id"] if air else None)
+                civitai_url = civitai_source_url(ref, civitai_version_id, air["model_id"] if air else None, config)
 
                 # Store CivitAI metadata (trigger words / base model) on pull so
                 # `mr show` can display them without a separate enrich step.
@@ -3106,18 +3373,30 @@ def engine_pull(
 
                     _log(log, f"Downloading {chosen_file} from {repo_id}...")
 
+                # Resolve/redirect the subdir from the repo's actual file path so
+                # 'loras/foo.safetensors' lands in <base>/loras/foo.safetensors
+                # instead of prompting and nesting <base>/loras/loras/foo.
+                _detected, _remainder = detect_comfyui_subdir(chosen_file)
+                if _detected and not subdir:
+                    subdir = _detected
+                    _log(log, f"  Auto-detected subdir {subdir} from repo path '{chosen_file}'")
+                elif _detected and subdir != _detected:
+                    _log(log, f"  Note: '{chosen_file}' is under '{_detected}'; keeping --subdir '{subdir}'")
+                if not subdir:
+                    raise MrError("subdir is required for ComfyUI downloads (e.g. checkpoints, loras, vae)")
+                dest_dir = base_dir / subdir
+                dest_dir.mkdir(parents=True, exist_ok=True)
+
                 _hf_kwargs = dict(
                     repo_id=repo_id, filename=chosen_file,
                     local_dir=str(dest_dir), token=token,
                 )
                 if revision:
                     _hf_kwargs["revision"] = revision
-                local_path = Path(hf_hub_download(**_hf_kwargs))
-
-                if dest_dir.exists():
-                    flatten_hf_subdir(dest_dir)
-                if not local_path.exists():
-                    local_path = dest_dir / local_path.name
+                local_path = place_downloaded_file(
+                    Path(hf_hub_download(**_hf_kwargs)), dest_dir,
+                    _remainder if _detected else None,
+                )
 
                 size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
                 fpath = str(local_path)

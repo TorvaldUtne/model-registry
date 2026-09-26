@@ -277,6 +277,10 @@ def init():
         "CivitAI token environment variable name (leave blank to skip)",
         default=defaults.get("civitai", {}).get("token_env_var", "CIVITAI_API_KEY"),
     )
+    civitai_web_host = click.prompt(
+        "CivitAI browse host for 'mr show' links (civitai.green=SFW, civitai.red=includes NSFW)",
+        default=defaults.get("civitai", {}).get("web_host", "civitai.green"),
+    )
 
     config = {
         "registry_db": db_path,
@@ -302,6 +306,8 @@ def init():
         },
         "civitai": {
             "token_env_var": civitai_env_var,
+            "web_host": civitai_web_host,
+            "api_host": "civitai.com",
         },
         "display": {
             "date_format": "%Y-%m-%d",
@@ -597,9 +603,13 @@ def report():
 
 
 @cli.command()
-@click.option("--all", "enrich_all", is_flag=True, default=False, help="Enrich all models with hf_repo, not just local ones")
+@click.option("--all", "enrich_all", is_flag=True, default=False, help="Enrich all models, not just local ones (also re-checks SHA-256 lookups)")
 def enrich(enrich_all):
-    """Fetch additional metadata (context window, parameters, architecture, stats) from HuggingFace Hub."""
+    """Fetch additional metadata from HuggingFace Hub and CivitAI.
+
+    Local ComfyUI files with no known source are looked up on CivitAI by their
+    SHA-256 hash.
+    """
     config = load_config()
     log = []
     try:
@@ -610,8 +620,9 @@ def enrich(enrich_all):
     for line in log:
         console.print(line)
     console.print(
-        f"\n[green]Enrichment complete.[/green] Updated [bold]{result['updated']}[/bold] of [bold]HF[/bold] model(s)"
-        f" and [bold]{result['civitai_updated']}[/bold] CivitAI model(s)."
+        f"\n[green]Enrichment complete.[/green] Updated [bold]{result['updated']}[/bold] HF"
+        f", [bold]{result['civitai_updated']}[/bold] CivitAI"
+        f", and [bold]{result['civitai_hash_updated']}[/bold] by-hash model(s)."
     )
 
 

@@ -47,7 +47,7 @@ Everything lives in `mr.py` — no modules, no packages. The flow is:
 - `find_model(conn, name)` — fuzzy match on `display_name` / `ollama_name`; prompts user to pick if ambiguous.
 - Every mutating operation writes an entry to the `events` table.
 - `source_type` values: `ollama_direct`, `ollama_hf`, `llamacpp`, `comfyui_unknown`, `comfyui_hf`, `comfyui_civitai`.
-- `source_url` stores either a CivitAI AIR tag (verbatim) or a `https://` browse URL. `get_model_link(row)` converts AIR tags to browse URLs on read.
+- `source_url` stores either a CivitAI AIR tag (verbatim) or a `https://` browse URL. `mr_core.get_model_link(row, config)` converts AIR tags to browse URLs on read, using the configured `civitai.web_host` (default `civitai.green`; `civitai.red` includes NSFW). `civitai.api_host` (default `civitai.com`) is used for API calls.
 - CivitAI token must be passed as a query param (`?token=…`), not an `Authorization` header, because the CDN redirect strips headers.
 
 ## Adding new columns
