@@ -21,10 +21,18 @@
     "token_env_var": "HF_TOKEN"
   },
   "civitai": {
-    "token_env_var": "CIVITAI_API_KEY"
+    "token_env_var": "CIVITAI_API_KEY",
+    "web_host": "civitai.green",
+    "api_host": "civitai.com"
   },
   "display": {
     "date_format": "%Y-%m-%d",
     "max_name_width": 60
+  },
+  "mcp": {
+    "host": "0.0.0.0",
+    "port": 8321,
+    "mode": "readonly",
+    "stateful": false
   }
 }
