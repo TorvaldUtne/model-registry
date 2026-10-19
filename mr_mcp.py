@@ -94,13 +94,14 @@ def register_read_tools(mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def mr_show(name: str) -> dict:
+    def mr_show(name: str, index: int | None = None) -> dict:
         """Show full details for one model (by partial name match).
 
         Returns tags, notes, link, plus the 10 most recent events. If the name
-        is ambiguous, an error with the matching models is returned.
+        is ambiguous, an error with the matching models is returned; retry with
+        index set to the 0-based position of the desired match.
         """
-        return _call(mr_core.engine_show, name=name)
+        return _call(mr_core.engine_show, name=name, index=index)
 
     @mcp.tool()
     def mr_report() -> dict:
@@ -143,39 +144,55 @@ def build_write_tools(mcp: MCPServer) -> None:
         rating: int,
         status: str | None = None,
         note: str | None = None,
+        index: int | None = None,
     ) -> dict:
         """Rate a model 1-5, optionally set its status and append a note.
         status: active|unrated|blacklisted|deleted|on_hold|testing|keep|favorite.
+        index: 0-based position to pick among ambiguous name matches.
         """
-        return _call(mr_core.engine_rate, name=name, rating=rating, status=status, note=note)
+        return _call(
+            mr_core.engine_rate,
+            name=name, rating=rating, status=status, note=note, index=index,
+        )
 
     @mcp.tool()
-    def mr_status(name: str, status: str) -> dict:
+    def mr_status(name: str, status: str, index: int | None = None) -> dict:
         """Set a model's status without requiring a rating.
         status: active|unrated|blacklisted|deleted|on_hold|testing|keep|favorite.
+        index: 0-based position to pick among ambiguous name matches.
         """
-        return _call(mr_core.engine_status, name=name, status=status)
+        return _call(mr_core.engine_status, name=name, status=status, index=index)
 
     @mcp.tool()
-    def mr_note(name: str, text: str) -> dict:
-        """Append a timestamped note to a model."""
-        return _call(mr_core.engine_note, name=name, text=text)
+    def mr_note(name: str, text: str, index: int | None = None) -> dict:
+        """Append a timestamped note to a model.
+        index: 0-based position to pick among ambiguous name matches.
+        """
+        return _call(mr_core.engine_note, name=name, text=text, index=index)
 
     @mcp.tool()
-    def mr_touch(name: str) -> dict:
+    def mr_touch(name: str, index: int | None = None) -> dict:
         """Update a model's last_used timestamp to now (call when you used a model
-        outside this tool)."""
-        return _call(mr_core.engine_touch, name=name)
+        outside this tool).
+        index: 0-based position to pick among ambiguous name matches.
+        """
+        return _call(mr_core.engine_touch, name=name, index=index)
 
     @mcp.tool()
-    def mr_tag(name: str, tags: list[str]) -> dict:
-        """Add tags to a model."""
-        return _call(mr_core.engine_tag, name=name, tags=tags)
+    def mr_tag(name: str, tags: list[str], index: int | None = None) -> dict:
+        """Add tags to a model.
+        index: 0-based position to pick among ambiguous name matches.
+        """
+        return _call(mr_core.engine_tag, name=name, tags=tags, index=index)
 
     @mcp.tool()
-    def mr_untag(name: str, tags: list[str] | None = None) -> dict:
-        """Remove tags from a model. If tags is empty, removes all tags."""
-        return _call(mr_core.engine_untag, name=name, tags=tags)
+    def mr_untag(
+        name: str, tags: list[str] | None = None, index: int | None = None
+    ) -> dict:
+        """Remove tags from a model. If tags is empty, removes all tags.
+        index: 0-based position to pick among ambiguous name matches.
+        """
+        return _call(mr_core.engine_untag, name=name, tags=tags, index=index)
 
     @mcp.tool()
     def mr_pull(
@@ -188,7 +205,7 @@ def build_write_tools(mcp: MCPServer) -> None:
         filename: str | None = None,
         allow_blacklisted: bool = False,
         enrich_filename: bool = False,
-        confirm: bool = True,
+        confirm: bool = False,
     ) -> dict:
         """Pull/download a model. Downloads files to disk and may create registry
         entries, so it is DESTRUCTIVE: pass confirm=True to proceed.
@@ -211,41 +228,50 @@ def build_write_tools(mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def mr_delete(name: str, confirm: bool = True) -> dict:
+    def mr_delete(name: str, confirm: bool = False, index: int | None = None) -> dict:
         """Delete a model from Ollama/disk. Keeps the registry row (sets
         status='deleted') but deletes the files. DESTRUCTIVE; pass confirm=True.
+
+        If the name matches more than one registry row an AmbiguousModel error
+        is returned with the candidates; retry with index set to the 0-based
+        position of the desired row.
         """
-        return _call(mr_core.engine_delete, name=name, confirm=confirm)
+        return _call(mr_core.engine_delete, name=name, confirm=confirm, index=index)
 
     @mcp.tool()
-    def mr_remove(name: str, confirm: bool = True) -> dict:
+    def mr_remove(name: str, confirm: bool = False, index: int | None = None) -> dict:
         """Remove a model's registry entry entirely (hard DB delete). Does NOT
-        delete files on disk. DESTRUCTIVE; pass confirm=True.
+        delete files on disk. DESTRUCTIVE; pass confirm=True. index disambiguates.
         """
-        return _call(mr_core.engine_remove, name=name, confirm=confirm)
+        return _call(mr_core.engine_remove, name=name, confirm=confirm, index=index)
 
     @mcp.tool()
-    def mr_removeall(dry_run: bool = False, confirm: bool = True) -> dict:
+    def mr_removeall(dry_run: bool = False, confirm: bool = False) -> dict:
         """Purge all models with status='deleted' from the registry (hard DB
         delete). Use dry_run=True first to preview. DESTRUCTIVE; pass confirm=True.
         """
         return _call(mr_core.engine_removeall, dry_run=dry_run, confirm=confirm)
 
     @mcp.tool()
-    def mr_rename(name: str, new_name: str, confirm: bool = True) -> dict:
+    def mr_rename(
+        name: str, new_name: str, confirm: bool = False, index: int | None = None
+    ) -> dict:
         """Rename a model on disk. For llama.cpp-style backends, renames the
         directory (file name unchanged). For ComfyUI, renames the FILE in place
         and enriches it with CivitAI metadata (version, base model, fp, civitai
-        id) when known. DESTRUCTIVE; pass confirm=True.
+        id) when known. DESTRUCTIVE; pass confirm=True. index disambiguates.
         """
-        return _call(mr_core.engine_rename, name=name, new_name=new_name, confirm=confirm)
+        return _call(
+            mr_core.engine_rename,
+            name=name, new_name=new_name, confirm=confirm, index=index,
+        )
 
     @mcp.tool()
     def mr_copy(
         src_backend: str,
         dst_backend: str,
         model_name: str,
-        confirm: bool = True,
+        confirm: bool = False,
     ) -> dict:
         """Copy a model from one GGUF backend to another (copies files, adds a
         new registry entry). DESTRUCTIVE; pass confirm=True.
@@ -261,20 +287,21 @@ def build_write_tools(mcp: MCPServer) -> None:
         name: str,
         reason: str | None = None,
         backend: str | None = None,
-        confirm: bool = True,
+        confirm: bool = False,
+        index: int | None = None,
     ) -> dict:
         """Set a model's status to blacklisted, record a reason, and delete its
         files if local. Works even if the model isn't in the registry yet (in
         which case backend is required: ollama|llamacpp|...|comfyui).
-        DESTRUCTIVE; pass confirm=True.
+        DESTRUCTIVE; pass confirm=True. index disambiguates.
         """
         return _call(
             mr_core.engine_blacklist,
-            name=name, reason=reason, backend=backend, confirm=confirm,
+            name=name, reason=reason, backend=backend, confirm=confirm, index=index,
         )
 
     @mcp.tool()
-    def mr_restore(dry_run: bool = False, confirm: bool = True) -> dict:
+    def mr_restore(dry_run: bool = False, confirm: bool = False) -> dict:
         """Re-download all missing ComfyUI models that have a known source
         (CivitAI or HuggingFace). Use dry_run=True first to preview.
         DESTRUCTIVE; pass confirm=True.
@@ -312,13 +339,25 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Mode: CLI --read-write or config mcp.mode; --readonly always wins
+    # Mode: CLI --read-write or config mcp.mode; --readonly always wins.
+    # Normalize common spellings so a hand-written "read-write"/"read_write"
+    # doesn't silently start the server read-only.
     if args.readonly:
         mode = "readonly"
     elif args.read_write:
         mode = "readwrite"
     else:
-        mode = mcp_cfg.get("mode", "readonly")
+        raw_mode = str(mcp_cfg.get("mode", "readonly")).strip().lower()
+        if raw_mode in ("readwrite", "read-write", "read_write", "rw", "write"):
+            mode = "readwrite"
+        elif raw_mode in ("readonly", "read-only", "read_only", "ro", "read"):
+            mode = "readonly"
+        else:
+            print(
+                f"WARNING: unknown mcp.mode '{raw_mode}'; defaulting to readonly.",
+                file=sys.stderr,
+            )
+            mode = "readonly"
 
     readwrite = mode == "readwrite"
     mr_core.set_writes_enabled(readwrite)

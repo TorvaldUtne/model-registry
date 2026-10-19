@@ -22,7 +22,7 @@
   },
   "civitai": {
     "token_env_var": "CIVITAI_API_KEY",
-    "web_host": "civitai.green",
+    "web_host": "civitai.red",
     "api_host": "civitai.com"
   },
   "display": {

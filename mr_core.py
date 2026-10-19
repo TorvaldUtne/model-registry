@@ -133,8 +133,10 @@ _HTTP_HEADERS = {
 }
 
 # CivitAI split its web frontend: green = SFW only, red = includes NSFW.
-# civitai.com is legacy for human browsing. The API still lives on civitai.com.
-CIVITAI_DEFAULT_WEB_HOST = "civitai.green"
+# The red host serves everything, so it is the default browse host; set
+# civitai.web_host to civitai.green to force SFW-only links. The API is served
+# on either host (civitai.com remains the documented default api_host).
+CIVITAI_DEFAULT_WEB_HOST = "civitai.red"
 CIVITAI_DEFAULT_API_HOST = "civitai.com"
 
 
@@ -310,11 +312,14 @@ def _file_sha256(path: str | Path, chunk_size: int = 1 << 20) -> str | None:
 
 
 def load_config() -> dict:
-    """Load config.json. Raises MrError if not found."""
+    """Load config.json. Raises MrError if not found or not valid JSON."""
     if not CONFIG_FILE.exists():
         raise MrError("config.json not found. Run 'mr init' first.")
     with open(CONFIG_FILE) as f:
-        return json.load(f)
+        try:
+            return json.load(f)
+        except json.JSONDecodeError as e:
+            raise MrError(f"config.json is not valid JSON: {e}") from e
 
 
 def get_db_path(config: dict) -> Path:
@@ -425,16 +430,33 @@ def _strip_model_extension(name: str) -> str | None:
     return None
 
 
+def _escape_like(term: str) -> str:
+    """Escape LIKE wildcards so a user term is matched literally.
+
+    Callers must pair this with ``LIKE ? ESCAPE '\\'``. Without it a name
+    containing ``_`` or ``%`` (common in ComfyUI filenames) silently matches
+    unrelated rows.
+    """
+    return (
+        term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+
+
 def _query_by_name(conn: sqlite3.Connection, name: str) -> list[sqlite3.Row]:
+    # Deterministic ordering is required so that an index chosen from one call
+    # selects the same row on a later call with the same name.
+    like = f"%{_escape_like(name)}%"
     return conn.execute(
         """SELECT * FROM models
-           WHERE display_name LIKE ? OR ollama_name LIKE ?
-           ORDER BY display_name""",
-        (f"%{name}%", f"%{name}%"),
+           WHERE display_name LIKE ? ESCAPE '\\' OR ollama_name LIKE ? ESCAPE '\\'
+           ORDER BY display_name, backend, id""",
+        (like, like),
     ).fetchall()
 
 
-def resolve_model(conn: sqlite3.Connection, name: str, index: int = 0) -> sqlite3.Row:
+def resolve_model(
+    conn: sqlite3.Connection, name: str, index: int | None = None
+) -> sqlite3.Row:
     """Return a single models row matching name (partial on display_name/ollama_name).
 
     - Exactly one match → returns it.
@@ -446,7 +468,12 @@ def resolve_model(conn: sqlite3.Connection, name: str, index: int = 0) -> sqlite
     raw name matches nothing it is retried without the extension.
 
     Args:
-        index: 0-based index to select among ambiguous matches.
+        index: 0-based index to select among ambiguous matches. Omit it (None)
+            to force an AmbiguousModel error when more than one row matches.
+
+    The same (name, index) pair always resolves to the same row because
+    ``_query_by_name`` orders deterministically, so callers can prompt for a
+    choice once and pass the index on to a later engine call.
     """
     rows = _query_by_name(conn, name)
 
@@ -471,6 +498,9 @@ def resolve_model(conn: sqlite3.Connection, name: str, index: int = 0) -> sqlite
     if len(rows) == 1:
         return rows[0]
 
+    if index is None:
+        raise AmbiguousModel(name, [dict(r) for r in rows])
+
     if index < 0 or index >= len(rows):
         raise MrError(f"Index {index} out of range for {len(rows)} matches")
 
@@ -478,12 +508,17 @@ def resolve_model(conn: sqlite3.Connection, name: str, index: int = 0) -> sqlite
 
 
 def find_matching_rows(conn: sqlite3.Connection, name: str) -> list[sqlite3.Row]:
-    """Return all models rows matching name (used by blacklist's manual lookup)."""
+    """Return all models rows matching name (partial on display_name/ollama_name).
+
+    Ordered identically to ``resolve_model`` so an index chosen from one call
+    selects the same row on another.
+    """
+    like = f"%{_escape_like(name)}%"
     return conn.execute(
         """SELECT * FROM models
-           WHERE display_name LIKE ? OR ollama_name LIKE ?
-           ORDER BY display_name""",
-        (f"%{name}%", f"%{name}%"),
+           WHERE display_name LIKE ? ESCAPE '\\' OR ollama_name LIKE ? ESCAPE '\\'
+           ORDER BY display_name, backend, id""",
+        (like, like),
     ).fetchall()
 
 
@@ -532,6 +567,16 @@ def get_gguf_backend_names(config: dict) -> list[str]:
         name for name in config.get("backends", {})
         if name not in ("ollama", "comfyui")
     ]
+
+
+def _backend_model_dir(config: dict, backend: str) -> Path | None:
+    """Return a GGUF backend's configured model_dir, or None if unset.
+
+    Guards against the Path("") == Path(".") trap, which would otherwise make
+    an unconfigured backend silently operate on the current working directory.
+    """
+    d = config.get("backends", {}).get(backend, {}).get("model_dir")
+    return Path(d) if d else None
 
 
 def run_ollama_list(container: str) -> list[str]:
@@ -587,18 +632,20 @@ def get_hf_metadata(hf_repo: str, hf_token: str | None) -> dict:
                     v for v in st["parameters"].values() if isinstance(v, (int, float))
                 )
 
-        card_data = getattr(model_info, "card_data", None) or getattr(
-            model_info, "cardData", None
-        )
-        if card_data and isinstance(card_data, dict):
-            if (
-                "architectures" in card_data
-                and isinstance(card_data["architectures"], list)
-                and card_data["architectures"]
-            ):
-                metadata["architecture"] = card_data["architectures"][0]
-            elif "model_name" in card_data:
-                name_lower = str(card_data["model_name"]).lower()
+        card_data = getattr(model_info, "card_data", None)
+        if card_data is not None:
+            # huggingface_hub exposes this as a CardData/ModelCardData object
+            # (not a dict), but older versions used a plain dict.
+            if isinstance(card_data, dict):
+                archs = card_data.get("architectures")
+                model_name = card_data.get("model_name")
+            else:
+                archs = getattr(card_data, "architectures", None)
+                model_name = getattr(card_data, "model_name", None)
+            if archs and isinstance(archs, (list, tuple)) and archs:
+                metadata["architecture"] = archs[0]
+            elif model_name:
+                name_lower = str(model_name).lower()
                 if "llama" in name_lower:
                     metadata["architecture"] = "Llama"
                 elif "mistral" in name_lower:
@@ -926,6 +973,9 @@ def parse_civitai_version_id(ref: str) -> str | None:
     m = re.search(r"[?&]modelVersionId=(\d+)", ref)
     if m:
         return m.group(1)
+    m = re.search(r"[?&]versionId=(\d+)", ref)
+    if m:
+        return m.group(1)
     return None
 
 
@@ -974,6 +1024,7 @@ def _parse_civitai_version_payload(data: dict) -> dict:
             "format": meta.get("format"),
             "primary": bool(f.get("primary")),
             "download_url": f.get("downloadUrl"),
+            "sha256": (f.get("hashes") or {}).get("SHA256"),
         })
     model = data.get("model") or {}
     return {
@@ -1001,7 +1052,7 @@ def fetch_civitai_version_info(
       model_type:      CivitAI model type (e.g. 'LORA', 'Checkpoint')
       version_id:      version id
       version_name:    version label (e.g. 'v3.0')
-      files:           list of dicts with id/name/type/(fp,format)/primary/download_url
+      files:           list of dicts with id/name/type/(fp,format)/primary/download_url/sha256
     Returns None on network/API failure (callers should fall back to defaults).
     """
     url = f"https://{host}/api/v1/model-versions/{version_id}"
@@ -1089,6 +1140,191 @@ def civitai_file_download_params(version_info, file_id) -> dict:
     return {"fileId": file_id}
 
 
+def _civitai_download_to_file(
+    download_url: str,
+    params: dict,
+    dest_dir: Path,
+    *,
+    version_id: str,
+    token_env: str,
+    selected_file: dict | None = None,
+    version_info: dict | None = None,
+    filename: str | None = None,
+    enrich_filename: bool = False,
+    air: dict | None = None,
+    log: list[str] | None = None,
+    progress_callback=None,
+) -> tuple[Path, int]:
+    """Download a CivitAI model version into dest_dir, resuming across runs.
+
+    Streams to '<final_name>.part' and atomically renames to the final name only
+    once the transfer is complete. If a '.part' file from a previous interrupted
+    run is present and the server advertises byte-range support, the transfer
+    resumes from the current file size via a 'Range: bytes=<n>-' request. An
+    already-complete final file is left untouched.
+
+    Returns (final_path, resumed_from_bytes).
+    """
+    try:
+        resp = requests.get(
+            download_url, params=params, headers=_HTTP_HEADERS,
+            stream=True, timeout=(30, None),
+        )
+    except requests.RequestException as e:
+        raise MrError(f"CivitAI download failed: {e}") from e
+
+    if resp.status_code == 401:
+        resp.close()
+        raise MrError(
+            f"CivitAI download failed: unauthorized. Check your {token_env} env var."
+        )
+    if resp.status_code != 200:
+        resp.close()
+        raise MrError(f"CivitAI download failed (HTTP {resp.status_code})")
+
+    cd = resp.headers.get("Content-Disposition", "")
+    filename_match = re.search(r'filename="?([^";\r\n]+)"?', cd)
+    out_filename = _sanitize_filename(filename_match.group(1)) if filename_match else ""
+    if not out_filename and selected_file and selected_file.get("name"):
+        out_filename = _sanitize_filename(selected_file["name"])
+    if not out_filename:
+        out_filename = _sanitize_filename(filename or "")
+    if not out_filename:
+        out_filename = f"civitai_{version_id}.bin"
+
+    local_path = dest_dir / out_filename
+
+    # Optional metadata-enriched filename (name + version + base model + fp + id).
+    if enrich_filename and version_info:
+        base_stem = version_info.get("model_name") or Path(out_filename).stem
+        model_id_for_name = (
+            (air.get("model_id") if air else None) or version_info.get("model_id") or None
+        )
+        enriched_stem = civitai_metadata_filename(
+            base_stem, version_info, selected_file, model_id_for_name
+        )
+        enriched_name = f"{enriched_stem}{Path(out_filename).suffix or '.safetensors'}"
+        if enriched_name != out_filename:
+            target_path = dest_dir / enriched_name
+            if target_path.exists():
+                _log(log, f"  {enriched_name} already exists — keeping {out_filename}")
+            else:
+                out_filename = enriched_name
+                local_path = target_path
+                _log(log, f"  Saving as {enriched_name}")
+
+    full_total = int(resp.headers.get("Content-Length", 0)) or None
+
+    # Already fully downloaded on a previous run: nothing to do.
+    if local_path.exists() and local_path.stat().st_size > 0:
+        size = local_path.stat().st_size
+        if full_total is None or size == full_total:
+            resp.close()
+            _log(log, f"Already downloaded: {local_path} ({size} bytes)")
+            return local_path, 0
+
+    part_path = local_path.with_name(local_path.name + ".part")
+    offset = part_path.stat().st_size if part_path.exists() else 0
+    accept_ranges = resp.headers.get("Accept-Ranges", "").lower() == "bytes"
+    total = full_total
+    mode = "wb"
+
+    # A leftover .part may belong to a different/older remote file. Only trust
+    # it when it is no larger than the current file; finalize an exact match and
+    # discard a larger one so a corrupt file is never renamed into place.
+    if full_total is not None:
+        if offset == full_total:
+            resp.close()
+            os.replace(part_path, local_path)
+            _log(log, f"Finalized {local_path.name} from {offset} cached bytes.")
+            return local_path, offset
+        if offset > full_total:
+            _log(log, "  Cached .part is larger than the remote file; restarting download.")
+            offset = 0
+            mode = "wb"
+
+    if offset > 0 and accept_ranges:
+        resp.close()
+        resume_headers = dict(_HTTP_HEADERS)
+        resume_headers["Range"] = f"bytes={offset}-"
+        _log(log, f"  Resuming {out_filename} from {offset} bytes...")
+        try:
+            resp = requests.get(
+                download_url, params=params, headers=resume_headers,
+                stream=True, timeout=(30, None),
+            )
+        except requests.RequestException as e:
+            raise MrError(
+                f"CivitAI download interrupted after {offset} bytes: {e}. "
+                "Rerun the same command to resume."
+            ) from e
+        if resp.status_code == 206:
+            content_range = resp.headers.get("Content-Range", "")
+            m = re.search(r"/(\d+)\s*$", content_range)
+            total = int(m.group(1)) if m else full_total
+            mode = "ab"
+        elif resp.status_code == 200:
+            _log(log, "  Server did not honor Range; restarting download.")
+            offset = 0
+            mode = "wb"
+            total = int(resp.headers.get("Content-Length", 0)) or None
+        elif resp.status_code == 416:
+            # Stale/oversized .part: drop it and restart the whole transfer.
+            resp.close()
+            _log(log, "  Server rejected Range request; restarting download.")
+            resp = requests.get(
+                download_url, params=params, headers=_HTTP_HEADERS,
+                stream=True, timeout=(30, None),
+            )
+            if resp.status_code != 200:
+                resp.close()
+                raise MrError(f"CivitAI download failed (HTTP {resp.status_code})")
+            offset = 0
+            mode = "wb"
+            total = int(resp.headers.get("Content-Length", 0)) or None
+        else:
+            resp.close()
+            raise MrError(f"CivitAI download failed (HTTP {resp.status_code})")
+    elif offset > 0:
+        _log(log, "  Server does not advertise Range support; restarting download.")
+        offset = 0
+
+    if total is not None and offset == total:
+        # The .part file already holds the whole file; just finalize it.
+        resp.close()
+        os.replace(part_path, local_path)
+        return local_path, offset
+
+    downloaded = offset
+    try:
+        with open(part_path, mode) as fh:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback is not None:
+                    progress_callback(downloaded, total, out_filename)
+    except requests.RequestException as e:
+        # Keep the .part file so a rerun can resume it.
+        raise MrError(
+            f"CivitAI download interrupted after {downloaded} bytes: {e}. "
+            "Rerun the same command to resume."
+        ) from e
+    finally:
+        resp.close()
+
+    final_size = part_path.stat().st_size
+    if total is not None and final_size < total:
+        raise MrError(
+            f"CivitAI download incomplete: {final_size}/{total} bytes. "
+            "Rerun the same command to resume."
+        )
+
+    os.replace(part_path, local_path)
+    return local_path, offset
+
+
 def civitai_source_url(ref: str, version_id, model_id=None, config: dict | None = None) -> str:
     """Return the value to store as source_url for a CivitAI download.
 
@@ -1133,27 +1369,34 @@ def _sanitize_filename(name: str) -> str:
 # ─── ComfyUI scanning ─────────────────────────────────────────────────────────
 
 
-def scan_comfyui(config: dict, conn: sqlite3.Connection) -> tuple[int, int]:
-    """Scan all immediate subdirs of the ComfyUI models base_dir. Returns (added, updated)."""
+def scan_comfyui(config: dict, conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """Scan all category subdirs of the ComfyUI models base_dir.
+
+    Returns (added, updated, merged). Category subdirs are searched
+    recursively, so files that `pull` placed under an extra folder
+    (e.g. loras/author/foo.safetensors) are still tracked.
+    """
     comfy_cfg = config["backends"].get("comfyui", {})
-    base_dir = Path(comfy_cfg.get("base_dir", ""))
+    base_dir = Path(comfy_cfg.get("base_dir", "") or "")
     extensions = comfy_cfg.get("extensions", [".safetensors", ".ckpt", ".pt", ".pth", ".bin"])
     now = now_iso()
     added = updated = 0
 
+    if not comfy_cfg.get("base_dir"):
+        raise MrError("ComfyUI base_dir is not configured.")
     if not base_dir.exists():
         raise MrError(f"ComfyUI base_dir does not exist: {base_dir}")
 
     subdirs = [d for d in base_dir.iterdir() if d.is_dir()]
     if not subdirs:
-        return added, updated
+        return added, updated, 0
 
     seen_paths = set()
     for subdir in sorted(subdirs):
         variant = subdir.name
         files = []
         for ext in extensions:
-            files.extend(subdir.glob(f"*{ext}"))
+            files.extend(subdir.rglob(f"*{ext}"))
         for f in sorted(files):
             fpath = str(f)
             seen_paths.add(fpath)
@@ -1200,18 +1443,34 @@ def scan_comfyui(config: dict, conn: sqlite3.Connection) -> tuple[int, int]:
                 )
                 added += 1
 
-    # Mark disappeared files as not-local
+    # Mark disappeared files as not-local (with an audit event per row).
     if seen_paths:
         placeholders = ",".join("?" * len(seen_paths))
-        conn.execute(
-            f"""UPDATE models SET currently_local=0, last_updated=?
-                WHERE backend='comfyui' AND file_path NOT IN ({placeholders})""",
-            (now, *seen_paths),
-        )
+        gone = conn.execute(
+            f"""SELECT id FROM models
+                WHERE backend='comfyui' AND currently_local=1
+                  AND file_path NOT IN ({placeholders})""",
+            tuple(seen_paths),
+        ).fetchall()
+        if gone:
+            conn.execute(
+                f"""UPDATE models SET currently_local=0, last_updated=?
+                    WHERE backend='comfyui' AND file_path NOT IN ({placeholders})""",
+                (now, *seen_paths),
+            )
     else:
+        gone = conn.execute(
+            "SELECT id FROM models WHERE backend='comfyui' AND currently_local=1"
+        ).fetchall()
+        if gone:
+            conn.execute(
+                "UPDATE models SET currently_local=0, last_updated=? WHERE backend='comfyui'",
+                (now,),
+            )
+    for r in gone:
         conn.execute(
-            "UPDATE models SET currently_local=0, last_updated=? WHERE backend='comfyui'",
-            (now,),
+            "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+            (r["id"], "scan_updated", now, json.dumps({"currently_local": 0})),
         )
 
     removed = _consolidate_comfyui_duplicates(conn, now)
@@ -1250,7 +1509,13 @@ def _consolidate_comfyui_duplicates(conn: sqlite3.Connection, now: str) -> int:
         local = [r for r in members if r["currently_local"]]
         if len(local) == 1:
             keeper = local[0]
-            donors = [r for r in members if r is not keeper]
+            # Only absorb duplicates whose file is genuinely gone; a row whose
+            # file still exists on disk is a real second copy, not stale.
+            donors = [
+                r for r in members
+                if r is not keeper
+                and not (r["file_path"] and Path(r["file_path"]).exists())
+            ]
         elif len(local) == 0:
             on_disk = [
                 r for r in members
@@ -1287,6 +1552,11 @@ def _consolidate_comfyui_duplicates(conn: sqlite3.Connection, now: str) -> int:
                 ),
             )
             removed += 1
+            # Refresh the keeper snapshot so a later donor merges onto the
+            # fields written by earlier donors instead of overwriting them.
+            keeper = conn.execute(
+                "SELECT * FROM models WHERE id=?", (keeper["id"],)
+            ).fetchone()
     if removed:
         conn.commit()
     return removed
@@ -1349,6 +1619,121 @@ def _absorb_comfyui_row(
             [*changes.values(), keeper["id"]],
         )
     return list(changes.keys())
+
+
+# ─── Content identity / blacklist lookup ──────────────────────────────────────
+
+
+def record_file_hash(conn: sqlite3.Connection, row, config: dict) -> str | None:
+    """Compute and persist a file-backed model's SHA-256.
+
+    Called before a file is deleted (delete/blacklist) so a model stays
+    identifiable by content after its file is gone. Returns the digest, or None
+    for Ollama models / unreadable files.
+    """
+    if row["file_hash"]:
+        return row["file_hash"]
+    if row["backend"] == "ollama" or not row["file_path"]:
+        return None
+    resolved = resolve_local_file_path(row["file_path"], config) or Path(row["file_path"])
+    digest = _file_sha256(resolved)
+    if digest:
+        conn.execute("UPDATE models SET file_hash=? WHERE id=?", (digest, row["id"]))
+    return digest
+
+
+def find_blacklisted_by_hash(conn: sqlite3.Connection, file_hash: str | None):
+    """Return a blacklisted model row with this SHA-256, or None."""
+    if not file_hash:
+        return None
+    return conn.execute(
+        "SELECT * FROM models WHERE status='blacklisted' AND file_hash=?",
+        (file_hash,),
+    ).fetchone()
+
+
+def _civitai_source_patterns(ref: str) -> list[str]:
+    """Build SQL LIKE patterns matching a CivitAI ref against stored source_url.
+
+    Stored source_urls take several forms: an AIR tag (``...civitai:MODEL@VER``),
+    or a browse URL (``.../models/MODEL?modelVersionId=VER`` or the
+    ``?versionId=VER`` fallback). Return a pattern for each so the lookup works
+    regardless of how the row was recorded.
+    """
+    air = parse_air_tag(ref)
+    model_id = air["model_id"] if air else parse_civitai_model_id(ref)
+    version_id = air["version_id"] if air else parse_civitai_version_id(ref)
+    if model_id and version_id:
+        return [f"%civitai:{model_id}@{version_id}%", f"%versionId={version_id}%"]
+    if model_id:
+        return [f"%civitai:{model_id}@%", f"%/models/{model_id}%"]
+    if version_id:
+        return [f"%versionId={version_id}%"]
+    return []
+
+
+def find_civitai_existing(conn: sqlite3.Connection, ref: str):
+    """Find a registry row referenced by a CivitAI ref via its source_url.
+
+    Blacklisted rows win so a re-pull of blacklisted content is blocked even
+    when other (non-blacklisted) versions of the same model also exist.
+    """
+    patterns = _civitai_source_patterns(ref)
+    if not patterns:
+        return None
+    where = " OR ".join("source_url LIKE ?" for _ in patterns)
+    return conn.execute(
+        f"""SELECT * FROM models WHERE {where}
+           ORDER BY CASE status WHEN 'blacklisted' THEN 0 ELSE 1 END,
+                    currently_local DESC, id DESC
+           LIMIT 1""",
+        tuple(patterns),
+    ).fetchone()
+
+
+def _has_blacklisted_hash(conn: sqlite3.Connection) -> bool:
+    return _scalar(
+        conn, "SELECT COUNT(*) FROM models WHERE status='blacklisted' AND file_hash IS NOT NULL"
+    ) > 0
+
+
+def guard_blacklisted_by_hash(
+    conn: sqlite3.Connection,
+    path: str | Path,
+    *,
+    allow_blacklisted: bool,
+    expected_hash: str | None = None,
+) -> str | None:
+    """Delete a just-downloaded file and raise if its SHA-256 is blacklisted.
+
+    Uses the source-provided `expected_hash` when known; otherwise hashes the
+    file on disk, but only when a blacklisted model actually has a stored hash.
+    """
+    digest = expected_hash
+    if not digest:
+        if not _has_blacklisted_hash(conn):
+            return None
+        digest = _file_sha256(path)
+    row = find_blacklisted_by_hash(conn, digest)
+    if row and not allow_blacklisted:
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
+        raise MrError(
+            f"Downloaded file matches blacklisted model '{row['display_name']}' "
+            f"(SHA-256 {digest}). Set allow_blacklisted=True to proceed."
+        )
+    return digest
+
+
+def _require_not_blacklisted(row, allow_blacklisted: bool) -> None:
+    """Raise if a matched row is blacklisted and the caller didn't opt in."""
+    if row is not None and row["status"] == "blacklisted" and not allow_blacklisted:
+        raise MrError(
+            f"Model is blacklisted: {row['display_name']}. "
+            "Set allow_blacklisted=True to proceed."
+        )
 
 
 # ─── File deletion (shared by delete/blacklist) ───────────────────────────────
@@ -1501,7 +1886,9 @@ def engine_list(
     return result
 
 
-def engine_show(config: dict | None = None, name: str | None = None) -> dict:
+def engine_show(
+    config: dict | None = None, name: str | None = None, index: int | None = None
+) -> dict:
     """Show full details (incl. tags, notes, link, recent events) for a model."""
     if config is None:
         config = load_config()
@@ -1511,7 +1898,7 @@ def engine_show(config: dict | None = None, name: str | None = None) -> dict:
     conn = get_db(config)
     init_db(conn)
     try:
-        row = resolve_model(conn, name)
+        row = resolve_model(conn, name, index)
         result = dict(row)
 
         tags = []
@@ -1654,8 +2041,14 @@ def engine_scan(
             for om in ollama_models:
                 oname = om["ollama_name"]
                 size_gb = om["size_gb"]
-                hf_repo, variant = parse_hf_repo_from_ollama(oname)
                 source_type = get_source_type(oname)
+                hf_repo, variant = parse_hf_repo_from_ollama(oname)
+                # A bare 'namespace/model' name is an Ollama registry model, not
+                # an HF repo. Only an explicit hf.co/huggingface.co prefix means
+                # the model came from HuggingFace; otherwise the same namespace
+                # would dedup-away unrelated tags (e.g. user/model:8b vs :70b).
+                if source_type != "ollama_hf":
+                    hf_repo = None
                 if hf_repo and hf_repo in seen_hf_repos:
                     _log(
                         log,
@@ -1750,7 +2143,10 @@ def engine_scan(
         bcfg = config["backends"][bname]
         if not bcfg.get("enabled", False):
             continue
-        model_dir = Path(bcfg.get("model_dir", ""))
+        if not bcfg.get("model_dir"):
+            _log(log, f"[red]{bname} has no model_dir configured; skipping.[/red]")
+            continue
+        model_dir = Path(bcfg["model_dir"])
         extensions = bcfg.get("extensions", [".gguf"])
         _log(log, f"\nScanning {bname} models in {model_dir}...")
         if not model_dir.exists():
@@ -1896,6 +2292,10 @@ def engine_scan(
                     "UPDATE models SET currently_local=0, last_updated=? WHERE id=?",
                     (now, row["id"]),
                 )
+                conn.execute(
+                    "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
+                    (row["id"], "scan_updated", now, json.dumps({"currently_local": 0})),
+                )
                 _log(log, f"  Marked not-local: {row['file_path']}")
 
     # ── ComfyUI ─────────────────────────────────────────────────────────────
@@ -1952,7 +2352,7 @@ def engine_enrich(
 
     # Local ComfyUI files with no known source: candidates for a SHA-256 lookup.
     # hash_checked is a negative cache so unmatched files aren't re-queried on
-    # every run; --all clears it and forces a re-check.
+    # every run; --all ignores the cache and re-checks every candidate.
     hash_where = (
         "WHERE backend='comfyui' AND file_path IS NOT NULL AND source_url IS NULL"
     )
@@ -2164,6 +2564,7 @@ def engine_rate(
     rating: int | None = None,
     status: str | None = None,
     note: str | None = None,
+    index: int | None = None,
 ) -> dict:
     """Rate a model (1-5) and set its status, with optional note."""
     _require_writes()
@@ -2182,7 +2583,7 @@ def engine_rate(
     init_db(conn)
     now = now_iso()
     try:
-        row = resolve_model(conn, name)
+        row = resolve_model(conn, name, index)
 
         notes = row["notes"] or ""
         if note:
@@ -2217,6 +2618,7 @@ def engine_status(
     config: dict | None = None,
     name: str | None = None,
     status: str | None = None,
+    index: int | None = None,
 ) -> dict:
     """Set a model's status without requiring a rating."""
     _require_writes()
@@ -2233,7 +2635,7 @@ def engine_status(
     init_db(conn)
     now = now_iso()
     try:
-        row = resolve_model(conn, name)
+        row = resolve_model(conn, name, index)
         conn.execute(
             "UPDATE models SET status=?, last_updated=? WHERE id=?",
             (status, now, row["id"]),
@@ -2257,6 +2659,7 @@ def engine_note(
     config: dict | None = None,
     name: str | None = None,
     text: str | None = None,
+    index: int | None = None,
 ) -> dict:
     """Append a timestamped note to a model."""
     _require_writes()
@@ -2269,7 +2672,7 @@ def engine_note(
     init_db(conn)
     now = now_iso()
     try:
-        row = resolve_model(conn, name)
+        row = resolve_model(conn, name, index)
         notes = row["notes"] or ""
         notes += f"\n[{now}] {text}"
         conn.execute(
@@ -2294,6 +2697,7 @@ def engine_note(
 def engine_touch(
     config: dict | None = None,
     name: str | None = None,
+    index: int | None = None,
 ) -> dict:
     """Update last_used to now (use when you ran a model outside this tool)."""
     _require_writes()
@@ -2306,7 +2710,7 @@ def engine_touch(
     init_db(conn)
     now = now_iso()
     try:
-        row = resolve_model(conn, name)
+        row = resolve_model(conn, name, index)
         conn.execute(
             "UPDATE models SET last_used=?, last_updated=? WHERE id=?",
             (now, now, row["id"]),
@@ -2329,6 +2733,7 @@ def engine_tag(
     config: dict | None = None,
     name: str | None = None,
     tags: list[str] | None = None,
+    index: int | None = None,
 ) -> dict:
     """Add tags to a model."""
     _require_writes()
@@ -2341,7 +2746,7 @@ def engine_tag(
     init_db(conn)
     now = now_iso()
     try:
-        row = resolve_model(conn, name)
+        row = resolve_model(conn, name, index)
 
         current = []
         if row["tags"]:
@@ -2377,6 +2782,7 @@ def engine_untag(
     config: dict | None = None,
     name: str | None = None,
     tags: list[str] | None = None,
+    index: int | None = None,
 ) -> dict:
     """Remove tags from a model. If tags is empty, removes all tags."""
     _require_writes()
@@ -2389,7 +2795,7 @@ def engine_untag(
     init_db(conn)
     now = now_iso()
     try:
-        row = resolve_model(conn, name)
+        row = resolve_model(conn, name, index)
 
         current = []
         if row["tags"]:
@@ -2428,6 +2834,7 @@ def engine_delete(
     config: dict | None = None,
     name: str | None = None,
     confirm: bool = False,
+    index: int | None = None,
 ) -> dict:
     """Delete a model from Ollama/disk. Keeps DB record, sets status='deleted'."""
     _require_writes()
@@ -2441,15 +2848,23 @@ def engine_delete(
     init_db(conn)
     now = now_iso()
     try:
-        row = resolve_model(conn, name)
+        row = resolve_model(conn, name, index)
 
+        # A hash only has lookup value after deletion if the model is
+        # blacklisted (it is what blocks a re-pull by content). Hashing a
+        # multi-GB checkpoint on a plain delete can take many minutes with no
+        # visible progress, so only do it when it actually matters.
+        if row["status"] == "blacklisted":
+            record_file_hash(conn, row, config)
         removed = _delete_model_files(row, config, conn)
         if row["backend"] == "ollama" and not removed:
             raise MrError("Model still present in Ollama; registry not updated.")
 
+        # Deleting a blacklisted model must not silently clear its blacklist.
+        new_status = "blacklisted" if row["status"] == "blacklisted" else "deleted"
         conn.execute(
-            "UPDATE models SET currently_local=0, status='deleted', last_updated=? WHERE id=?",
-            (now, row["id"]),
+            "UPDATE models SET currently_local=0, status=?, last_updated=? WHERE id=?",
+            (new_status, now, row["id"]),
         )
         conn.execute(
             "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
@@ -2457,7 +2872,7 @@ def engine_delete(
         )
         conn.commit()
         return {
-            "status": "deleted",
+            "status": new_status,
             "display_name": row["display_name"],
             "file_removed": removed,
             "timestamp": now,
@@ -2470,6 +2885,7 @@ def engine_remove(
     config: dict | None = None,
     name: str | None = None,
     confirm: bool = False,
+    index: int | None = None,
 ) -> dict:
     """Remove a model from the registry entirely (hard delete of DB row)."""
     _require_writes()
@@ -2483,7 +2899,7 @@ def engine_remove(
     init_db(conn)
     now = now_iso()
     try:
-        row = resolve_model(conn, name)
+        row = resolve_model(conn, name, index)
         conn.execute("DELETE FROM events WHERE model_id=?", (row["id"],))
         conn.execute("DELETE FROM models WHERE id=?", (row["id"],))
         conn.commit()
@@ -2549,8 +2965,15 @@ def engine_copy(
     dst_backend: str | None = None,
     model_name: str | None = None,
     confirm: bool = False,
+    index: int | None = None,
 ) -> dict:
-    """Copy a model from one GGUF backend to another."""
+    """Copy a model from one GGUF backend to another.
+
+    A directory-model (files under <model_dir>/<Name>/) is copied wholesale to
+    <dst_model_dir>/<Name>/; a top-level single-file model (<model_dir>/x.gguf)
+    is copied to <dst_model_dir>/x.gguf. Pass index to disambiguate when more
+    than one row matches.
+    """
     _require_writes()
     _require_confirm(confirm)
     if config is None:
@@ -2558,55 +2981,87 @@ def engine_copy(
     if not src_backend or not dst_backend or not model_name:
         raise MrError("src_backend, dst_backend, and model_name are required")
 
+    if src_backend not in config.get("backends", {}):
+        raise MrError(f"Unknown source backend: {src_backend}")
+    if dst_backend not in config.get("backends", {}):
+        raise MrError(f"Unknown destination backend: {dst_backend}")
+    if src_backend in ("ollama", "comfyui"):
+        raise MrError(f"Cannot copy from {src_backend} - only GGUF backends are supported.")
+    if dst_backend in ("ollama", "comfyui"):
+        raise MrError(f"Cannot copy to {dst_backend} - use 'mr pull' instead.")
+
+    src_model_dir = _backend_model_dir(config, src_backend)
+    dst_model_dir = _backend_model_dir(config, dst_backend)
+    if src_model_dir is None:
+        raise MrError(f"Source backend '{src_backend}' has no model_dir configured.")
+    if dst_model_dir is None:
+        raise MrError(f"Destination backend '{dst_backend}' has no model_dir configured.")
+    if not dst_model_dir.exists():
+        raise MrError(f"Destination directory does not exist: {dst_model_dir}")
+
     conn = get_db(config)
     init_db(conn)
     now = now_iso()
     try:
         rows = conn.execute(
             """SELECT * FROM models
-               WHERE display_name LIKE ? AND backend=?
-               ORDER BY display_name""",
-            (f"%{model_name}%", src_backend),
+               WHERE display_name LIKE ? ESCAPE '\\' AND backend=?
+               ORDER BY display_name, id""",
+            (f"%{_escape_like(model_name)}%", src_backend),
         ).fetchall()
 
         if not rows:
             raise MrError(f"Model '{model_name}' not found in backend '{src_backend}'")
-        if len(rows) > 1:
+        if len(rows) == 1:
+            row = rows[0]
+        elif index is None:
             raise AmbiguousModel(model_name, [dict(r) for r in rows])
-        row = rows[0]
+        elif index < 0 or index >= len(rows):
+            raise MrError(f"Index {index} out of range for {len(rows)} matches")
+        else:
+            row = rows[index]
 
-        if row["backend"] == "ollama":
-            raise MrError("Cannot copy from Ollama - use 'mr pull' instead.")
-        if row["backend"] == "comfyui":
-            raise MrError("Cannot copy from ComfyUI - only GGUF backends are supported.")
-        if dst_backend == "ollama":
-            raise MrError("Cannot copy to Ollama - use 'mr pull' instead.")
-        if dst_backend == "comfyui":
-            raise MrError("Cannot copy to ComfyUI - only GGUF backends are supported.")
+        if row["backend"] != src_backend:
+            raise MrError(f"Model is not in backend '{src_backend}'.")
 
         src_path = Path(row["file_path"]) if row["file_path"] else None
         if not src_path or not src_path.exists():
             raise MrError(f"Source file not found: {row['file_path']}")
 
-        dst_cfg = config["backends"].get(dst_backend, {})
-        dst_model_dir = Path(dst_cfg.get("model_dir", ""))
-        if not dst_model_dir.exists():
-            raise MrError(f"Destination directory does not exist: {dst_model_dir}")
+        src_dir = src_path.parent
+        try:
+            is_top_level = src_dir.resolve() == src_model_dir.resolve()
+        except OSError:
+            is_top_level = src_dir == src_model_dir
 
-        repo_name = src_path.parent.name
-        dst_dir = dst_model_dir / repo_name
+        if is_top_level:
+            model_display = src_path.stem
+            files_to_copy = [src_path]
+            dst_dir = dst_model_dir
+        else:
+            model_display = src_dir.name
+            files_to_copy = [f for f in src_dir.iterdir() if f.is_file()]
+            dst_dir = dst_model_dir / src_dir.name
+
+        copied_ggufs = [f for f in files_to_copy if f.suffix.lower() == ".gguf"]
+        if not copied_ggufs:
+            raise MrError("Source directory contains no GGUF files")
+
+        dst_main = dst_dir / max(copied_ggufs, key=lambda f: f.stat().st_size).name
+        if conn.execute(
+            "SELECT 1 FROM models WHERE backend=? AND file_path=?",
+            (dst_backend, str(dst_main)),
+        ).fetchone():
+            raise MrError(
+                f"Destination already registered: {dst_main}. Remove it first."
+            )
+
         dst_dir.mkdir(parents=True, exist_ok=True)
+        for f in files_to_copy:
+            shutil.copy2(f, dst_dir / f.name)
 
-        for f in src_path.parent.glob("*"):
-            if f.is_file():
-                shutil.copy2(f, dst_dir / f.name)
-
-        dst_files = list(dst_dir.glob("*.gguf"))
-        if not dst_files:
-            raise MrError("No GGUF files found in destination directory")
-
-        main_file = max(dst_files, key=lambda f: f.stat().st_size)
-        main_path = Path(main_file)
+        dst_files = [dst_dir / f.name for f in copied_ggufs]
+        main_path = max(dst_files, key=lambda f: f.stat().st_size)
         total_size = sum(f.stat().st_size for f in dst_files)
         size_gb = round(total_size / (1024 ** 3), 2)
         variant = parse_variant_from_filename(main_path.name)
@@ -2616,7 +3071,7 @@ def engine_copy(
                (display_name, hf_repo, variant, backend, source_type,
                 file_path, size_gb, currently_local, first_seen, last_updated)
                VALUES (?,?,?,?,?,?,?,1,?,?)""",
-            (dst_dir.name, row["hf_repo"], variant, dst_backend, dst_backend,
+            (model_display, row["hf_repo"], variant, dst_backend, dst_backend,
              str(main_path), size_gb, now, now),
         )
         mid = _last_id(conn)
@@ -2624,13 +3079,13 @@ def engine_copy(
             "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
             (mid, "copy", now, json.dumps({
                 "from": f"{src_backend}:{row['display_name']}",
-                "to": f"{dst_backend}:{dst_dir.name}",
+                "to": f"{dst_backend}:{model_display}",
             })),
         )
         conn.commit()
         return {
             "status": "copied",
-            "display_name": dst_dir.name,
+            "display_name": model_display,
             "backend": dst_backend,
             "size_gb": size_gb,
             "timestamp": now,
@@ -2644,6 +3099,7 @@ def engine_rename(
     name: str | None = None,
     new_name: str | None = None,
     confirm: bool = False,
+    index: int | None = None,
 ) -> dict:
     """Rename a model on disk.
 
@@ -2663,7 +3119,7 @@ def engine_rename(
     init_db(conn)
     now = now_iso()
     try:
-        row = resolve_model(conn, name)
+        row = resolve_model(conn, name, index)
 
         if row["backend"] == "ollama":
             raise MrError("Ollama models don't have directories to rename.")
@@ -2703,6 +3159,9 @@ def engine_rename(
             raise MrError(f"File not found on disk: {old_path}")
 
         new_name = _sanitize_filename(new_name)
+        clean_name = _strip_model_extension(new_name) or new_name
+        if not clean_name:
+            raise MrError("new_name must not be empty.")
         if row["backend"] == "comfyui":
             # ── ComfyUI: rename the file in place, enriched with metadata ──
             version_info = None
@@ -2725,8 +3184,8 @@ def engine_rename(
                         selected_file = next(
                             (f for f in version_info["files"] if f["id"] == air["file_id"]), None
                         )
-            new_stem = civitai_metadata_filename(new_name, version_info, selected_file, model_id) \
-                if row["source_type"] == "comfyui_civitai" else new_name
+            new_stem = civitai_metadata_filename(clean_name, version_info, selected_file, model_id) \
+                if row["source_type"] == "comfyui_civitai" else clean_name
             new_path = old_dir / f"{new_stem}{old_path.suffix}"
             if new_path == old_path:
                 display_name = old_path.stem
@@ -2736,13 +3195,29 @@ def engine_rename(
                 old_path.rename(new_path)
                 display_name = new_path.stem
         else:
-            # ── llama-style: rename the directory, keep the file name ──
-            new_dir = old_dir.with_name(new_name)
-            if new_dir.exists():
-                raise MrError(f"Directory already exists: {new_dir}")
-            old_dir.rename(new_dir)
-            new_path = new_dir / old_path.name
-            display_name = new_path.stem
+            model_dir = _backend_model_dir(config, row["backend"])
+            try:
+                is_top_level = model_dir is not None and old_dir.resolve() == model_dir.resolve()
+            except OSError:
+                is_top_level = model_dir is not None and old_dir == model_dir
+            if is_top_level:
+                # ── top-level single-file model: rename the file in place ──
+                new_path = old_dir / f"{clean_name}{old_path.suffix}"
+                if new_path == old_path:
+                    display_name = old_path.stem
+                else:
+                    if new_path.exists():
+                        raise MrError(f"File already exists: {new_path}")
+                    old_path.rename(new_path)
+                    display_name = new_path.stem
+            else:
+                # ── llama-style: rename the directory, keep the file name ──
+                new_dir = old_dir.with_name(clean_name)
+                if new_dir.exists():
+                    raise MrError(f"Directory already exists: {new_dir}")
+                old_dir.rename(new_dir)
+                new_path = new_dir / old_path.name
+                display_name = new_dir.name
 
         conn.execute(
             "UPDATE models SET file_path=?, display_name=?, last_updated=? WHERE id=?",
@@ -2770,6 +3245,7 @@ def engine_blacklist(
     reason: str | None = None,
     backend: str | None = None,
     confirm: bool = False,
+    index: int | None = None,
 ) -> dict:
     """Set a model's status to blacklisted, record reason, and delete it from disk.
 
@@ -2787,28 +3263,27 @@ def engine_blacklist(
     init_db(conn)
     now = now_iso()
     try:
-        rows = find_matching_rows(conn, name)
-
-        if not rows:
+        try:
+            row = resolve_model(conn, name, index)
+        except ModelNotFound:
             if not backend:
                 raise MrError(
                     "Model not found in registry. backend is required to add a new blacklisted entry."
                 )
+            source_type = get_source_type(name)
             hf_repo, variant = parse_hf_repo_from_ollama(name)
+            if source_type != "ollama_hf":
+                hf_repo = None
             conn.execute(
                 """INSERT INTO models
                    (display_name, hf_repo, variant, backend, source_type,
                     ollama_name, currently_local, first_seen, last_updated)
                    VALUES (?,?,?,?,?,?,0,?,?)""",
-                (name, hf_repo, variant, backend, get_source_type(name),
+                (name, hf_repo, variant, backend, source_type,
                  name if backend == "ollama" else None, now, now),
             )
             mid = _last_id(conn)
             row = conn.execute("SELECT * FROM models WHERE id=?", (mid,)).fetchone()
-        elif len(rows) == 1:
-            row = rows[0]
-        else:
-            raise AmbiguousModel(name, [dict(r) for r in rows])
 
         reason_text = reason or "no reason specified"
         notes = row["notes"] or ""
@@ -2824,7 +3299,10 @@ def engine_blacklist(
         )
 
         if row["currently_local"]:
-            _delete_model_files(row, config, conn)
+            record_file_hash(conn, row, config)
+            removed = _delete_model_files(row, config, conn)
+            if not removed and row["backend"] == "ollama":
+                raise MrError("Model still present in Ollama; registry not updated.")
             conn.execute(
                 "UPDATE models SET currently_local=0 WHERE id=?", (row["id"],)
             )
@@ -2905,25 +3383,35 @@ def engine_pull(
             else:
                 backend = "ollama"
 
-        # Pre-pull blacklist/deleted check
+        # Pre-pull blacklist/deleted check. A previously-seen entry is matched by
+        # HF repo, pasted/partial name, or the CivitAI model@version/versionId in
+        # its source_url; blacklisted files deleted before their hash was
+        # recorded are still caught this way. Content identity (SHA-256) is
+        # checked again after download (ComfyUI and GGUF) for files re-uploaded
+        # under a different id.
         hf_repo, _ = parse_hf_repo_from_ollama(ref)
         existing = None
         if hf_repo:
             existing = conn.execute(
-                "SELECT * FROM models WHERE hf_repo=?", (hf_repo,)
+                """SELECT * FROM models WHERE hf_repo=?
+                   ORDER BY CASE status WHEN 'blacklisted' THEN 0 ELSE 1 END,
+                            currently_local DESC, id DESC
+                   LIMIT 1""",
+                (hf_repo,),
             ).fetchone()
         if not existing:
             existing = conn.execute(
-                "SELECT * FROM models WHERE display_name LIKE ? OR ollama_name=?",
-                (f"%{ref}%", ref),
+                """SELECT * FROM models
+                   WHERE display_name LIKE ? ESCAPE '\\' OR ollama_name=?
+                   ORDER BY CASE status WHEN 'blacklisted' THEN 0 ELSE 1 END,
+                            currently_local DESC, id DESC
+                   LIMIT 1""",
+                (f"%{_escape_like(ref)}%", ref),
             ).fetchone()
+        if not existing:
+            existing = find_civitai_existing(conn, ref)
 
-        if existing and existing["status"] == "blacklisted":
-            if not allow_blacklisted:
-                raise MrError(
-                    f"Model is blacklisted: {existing['display_name']}. "
-                    "Set allow_blacklisted=True to proceed."
-                )
+        _require_not_blacklisted(existing, allow_blacklisted)
         if existing and existing["status"] == "deleted" and not allow_blacklisted:
             _log(
                 log,
@@ -2981,7 +3469,9 @@ def engine_pull(
         # ── GGUF file backends ───────────────────────────────────────────────
         elif backend in get_gguf_backend_names(config):
             backend_cfg = config["backends"].get(backend, {})
-            model_dir = Path(backend_cfg.get("model_dir", ""))
+            model_dir = _backend_model_dir(config, backend)
+            if model_dir is None:
+                raise MrError(f"Backend '{backend}' has no model_dir configured.")
             if not model_dir.exists():
                 raise MrError(f"Model directory for {backend} does not exist: {model_dir}")
 
@@ -3046,6 +3536,11 @@ def engine_pull(
                     _log(log, f"  Flattened {gguf_file} to: {local_path}")
                 else:
                     _log(log, f"  Downloaded: {gguf_file}")
+                # Content check: refuse (and remove) a GGUF whose SHA-256 matches
+                # a blacklisted model, even when re-pulled under a new repo name.
+                guard_blacklisted_by_hash(
+                    conn, local_path, allow_blacklisted=allow_blacklisted,
+                )
                 downloaded_paths.append(str(local_path))
 
             total_size = sum(Path(p).stat().st_size for p in downloaded_paths)
@@ -3208,63 +3703,39 @@ def engine_pull(
                     params.update(file_params)
                     _log(log, f"  Requesting exact file id {air_file_id} from the AIR tag")
                 _log(log, f"Downloading from CivitAI (version {civitai_version_id})...")
-                resp = requests.get(download_url, params=params, stream=True, timeout=(30, None))
-                if resp.status_code == 401:
-                    raise MrError(f"CivitAI download failed: unauthorized. Check your {token_env} env var.")
-                if resp.status_code != 200:
-                    raise MrError(f"CivitAI download failed (HTTP {resp.status_code})")
-
-                cd = resp.headers.get("Content-Disposition", "")
-                filename_match = re.search(r'filename="?([^";\r\n]+)"?', cd)
-                out_filename = _sanitize_filename(filename_match.group(1)) if filename_match else ""
-                if not out_filename and selected_file and selected_file.get("name"):
-                    out_filename = _sanitize_filename(selected_file["name"])
-                if not out_filename:
-                    out_filename = _sanitize_filename(filename or "")
-                if not out_filename:
-                    out_filename = f"civitai_{civitai_version_id}.bin"
-
-                local_path = dest_dir / out_filename
-
-                # Optional metadata-enriched filename (name + version + base
-                # model + fp + civitai id) so downloaded files are easy to pick
-                # out in ComfyUI and traceable back to the CivitAI page.
-                if enrich_filename and version_info:
-                    base_stem = version_info.get("model_name") or Path(out_filename).stem
-                    model_id_for_name = (
-                        (air.get("model_id") if air else None) or version_info.get("model_id") or None
-                    )
-                    enriched_stem = civitai_metadata_filename(
-                        base_stem, version_info, selected_file, model_id_for_name
-                    )
-                    enriched_name = f"{enriched_stem}{Path(out_filename).suffix or '.safetensors'}"
-                    if enriched_name != out_filename:
-                        target_path = dest_dir / enriched_name
-                        if target_path.exists():
-                            _log(log, f"  {enriched_name} already exists — keeping {out_filename}")
-                        else:
-                            out_filename = enriched_name
-                            local_path = target_path
-                            _log(log, f"  Saving as {enriched_name}")
-
-                total = int(resp.headers.get("Content-Length", 0)) or None
-                downloaded = 0
-                try:
-                    with open(local_path, "wb") as fh:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            fh.write(chunk)
-                            downloaded += len(chunk)
-                            if progress_callback is not None:
-                                progress_callback(downloaded, total, out_filename)
-                except Exception:
-                    local_path.unlink(missing_ok=True)
-                    raise
+                local_path, resumed_from = _civitai_download_to_file(
+                    download_url,
+                    params,
+                    dest_dir,
+                    version_id=civitai_version_id,
+                    token_env=token_env,
+                    selected_file=selected_file,
+                    version_info=version_info,
+                    filename=filename,
+                    enrich_filename=enrich_filename,
+                    air=air,
+                    log=log,
+                    progress_callback=progress_callback,
+                )
 
                 size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
                 fpath = str(local_path)
 
+                # Content check: refuse (and remove) a file whose SHA-256 matches
+                # a blacklisted model, even if its id/name changed upstream.
+                guard_blacklisted_by_hash(
+                    conn, local_path, allow_blacklisted=allow_blacklisted,
+                    expected_hash=(selected_file or {}).get("sha256"),
+                )
+
                 air = parse_air_tag(ref)
-                civitai_url = civitai_source_url(ref, civitai_version_id, air["model_id"] if air else None, config)
+                model_id_for_url = (
+                    (air["model_id"] if air else None)
+                    or (version_info.get("model_id") if version_info else None)
+                )
+                civitai_url = civitai_source_url(
+                    ref, civitai_version_id, model_id_for_url, config
+                )
 
                 # Store CivitAI metadata (trigger words / base model) on pull so
                 # `mr show` can display them without a separate enrich step.
@@ -3280,6 +3751,12 @@ def engine_pull(
                 existing_comfy = existing if (existing and existing["backend"] == "comfyui") else None
                 if existing_by_path or existing_comfy:
                     row_to_update = existing_by_path or existing_comfy
+                    if row_to_update["status"] == "blacklisted" and not allow_blacklisted:
+                        local_path.unlink(missing_ok=True)
+                        raise MrError(
+                            f"Model is blacklisted: {row_to_update['display_name']}. "
+                            "Set allow_blacklisted=True to proceed."
+                        )
                     conn.execute(
                         """UPDATE models
                            SET currently_local=1, times_downloaded=times_downloaded+1,
@@ -3308,7 +3785,7 @@ def engine_pull(
                 conn.execute(
                     "INSERT INTO events (model_id, event_type, timestamp, detail) VALUES (?,?,?,?)",
                     (mid, "pull", now, json.dumps({
-                        "civitai_version_id": civitai_version_id, "file": out_filename,
+                        "civitai_version_id": civitai_version_id, "file": local_path.name,
                     })),
                 )
                 conn.commit()
@@ -3320,6 +3797,7 @@ def engine_pull(
                     "file_path": str(local_path),
                     "size_gb": size_gb,
                     "model_id": mid,
+                    "resumed_from": resumed_from,
                     "timestamp": now,
                 }
 
@@ -3401,12 +3879,24 @@ def engine_pull(
                 size_gb = round(local_path.stat().st_size / (1024 ** 3), 4)
                 fpath = str(local_path)
 
+                # Content check: refuse (and remove) a file whose SHA-256 matches
+                # a blacklisted model, even if its id/name changed upstream.
+                guard_blacklisted_by_hash(
+                    conn, local_path, allow_blacklisted=allow_blacklisted,
+                )
+
                 existing_by_path = conn.execute(
                     "SELECT * FROM models WHERE file_path=?", (fpath,)
                 ).fetchone()
                 existing_comfy = existing if (existing and existing["backend"] == "comfyui") else None
                 if existing_by_path or existing_comfy:
                     row_to_update = existing_by_path or existing_comfy
+                    if row_to_update["status"] == "blacklisted" and not allow_blacklisted:
+                        local_path.unlink(missing_ok=True)
+                        raise MrError(
+                            f"Model is blacklisted: {row_to_update['display_name']}. "
+                            "Set allow_blacklisted=True to proceed."
+                        )
                     conn.execute(
                         """UPDATE models
                            SET currently_local=1, times_downloaded=times_downloaded+1,
@@ -3469,6 +3959,7 @@ def engine_restore(
         restorable = conn.execute(
             """SELECT * FROM models
                WHERE backend='comfyui' AND currently_local=0
+                 AND (status IS NULL OR status != 'blacklisted')
                  AND (source_url IS NOT NULL OR hf_repo IS NOT NULL)
                ORDER BY display_name"""
         ).fetchall()

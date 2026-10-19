@@ -111,7 +111,7 @@ python mr.py report
   },
   "civitai": {
     "token_env_var": "CIVITAI_API_KEY",
-    "web_host": "civitai.green",
+    "web_host": "civitai.red",
     "api_host": "civitai.com"
   },
   "display": {
@@ -129,7 +129,7 @@ python mr.py report
 
 Set `registry_db` to an absolute path to store the database somewhere other than the script directory. Leave blank to use `registry.db` next to `mr.py`.
 
-CivitAI split its web frontend: `civitai.green` (SFW only) and `civitai.red` (includes NSFW); `civitai.com` is legacy for browsing. `civitai.web_host` controls the browse links shown by `mr show` (default `civitai.green`); `civitai.api_host` controls API calls (default `civitai.com`).
+CivitAI split its web frontend: `civitai.green` (SFW only) and `civitai.red` (includes NSFW; serves all models). `civitai.web_host` controls the browse links shown by `mr show` (default `civitai.red`); `civitai.api_host` controls API calls (default `civitai.com`, except that a CivitAI URL ref uses the host from that URL).
 
 The optional `mcp` section configures the MCP server:
 
@@ -287,7 +287,7 @@ MIT — see [LICENSE](LICENSE).
 
 ### Unreleased
 - `mr enrich` now matches unenriched ComfyUI files on CivitAI by SHA-256 hash, backfilling provenance (`source_url`/`source_type`), base model, and trigger words. Add new `file_hash`/`hash_checked` columns (unmatched files are cached to avoid re-lookups; `--all` re-checks).
-- CivitAI browse links are configurable: `civitai.web_host` (default `civitai.green`; `civitai.red` includes NSFW) and `civitai.api_host` (default `civitai.com`).
+- CivitAI browse links are configurable: `civitai.web_host` (default `civitai.red`; `civitai.green` is SFW-only) and `civitai.api_host` (default `civitai.com`).
 - `mr rename` / model resolution now tolerate a filename passed with its extension (`foo.safetensors` → `foo`).
 - `mr pull --backend comfyui` auto-detects the ComfyUI subdir from the repo file path (e.g. `loras/foo.safetensors`, `text_encoders/...`) and no longer nests `models/loras/loras/foo`; meaningful extra folders (e.g. `loras/author/foo`) are preserved.
 

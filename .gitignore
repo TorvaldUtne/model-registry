@@ -2,6 +2,7 @@ config.json
 registry.db*
 venv/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 .env
@@ -14,6 +15,7 @@ AGENTS.md
 !CLAUDE.md
 !README.md
 
-# Exclude text files but keep requirements.txt
+# Exclude text files but keep requirements.txt and requirements-dev.txt
 *.txt
 !requirements.txt
+!requirements-dev.txt

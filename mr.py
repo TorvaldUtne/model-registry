@@ -103,26 +103,35 @@ def _handle_engine_error(e):
     elif isinstance(e, AmbiguousModel):
         console.print(f"[yellow]{e}[/yellow]")
         for i, m in enumerate(e.matches, 1):
-            console.print(f"  {i}. {m['display_name']}  [{m['backend']}]")
+            local = "(local)" if m.get("currently_local") else "(remote)"
+            path = f"  [dim]{m['file_path']}[/dim]" if m.get("file_path") else ""
+            console.print(f"  {i}. {m['display_name']}  [{m['backend']}] {local}{path}")
+        console.print("[dim]Re-run with a more specific name to pick a single match.[/dim]")
     else:
         console.print(f"[red]Error: {e}[/red]")
     return 1
 
 
 def resolve_model_interactive(config, name):
-    """Resolve a model, prompting the user to disambiguate if needed."""
+    """Resolve a model, prompting the user to disambiguate if needed.
+
+    Returns ``(row, index)``. ``index`` is the 0-based position of ``row``
+    among all matches, so callers can forward it to an engine function to
+    re-select the exact same row.
+    """
     conn = mr_core.get_db(config)
     mr_core.init_db(conn)
     try:
         try:
-            return mr_core.resolve_model(conn, name)
+            return mr_core.resolve_model(conn, name), 0
         except AmbiguousModel as e:
             console.print(f"[yellow]Multiple models match '{name}':[/yellow]")
             for i, m in enumerate(e.matches, 1):
                 local = "(local)" if m["currently_local"] else "(remote)"
-                console.print(f"  {i}. {m['display_name']}  [{m['backend']}] {local}")
+                path = f"  [dim]{m['file_path']}[/dim]" if m["file_path"] else ""
+                console.print(f"  {i}. {m['display_name']}  [{m['backend']}] {local}{path}")
             choice = click.prompt("Pick a number", type=click.IntRange(1, len(e.matches)))
-            return mr_core.resolve_model(conn, name, index=choice - 1)
+            return mr_core.resolve_model(conn, name, index=choice - 1), choice - 1
     finally:
         conn.close()
 
@@ -278,8 +287,8 @@ def init():
         default=defaults.get("civitai", {}).get("token_env_var", "CIVITAI_API_KEY"),
     )
     civitai_web_host = click.prompt(
-        "CivitAI browse host for 'mr show' links (civitai.green=SFW, civitai.red=includes NSFW)",
-        default=defaults.get("civitai", {}).get("web_host", "civitai.green"),
+        "CivitAI browse host for 'mr show' links (civitai.red=includes NSFW, civitai.green=SFW only)",
+        default=defaults.get("civitai", {}).get("web_host", "civitai.red"),
     )
 
     config = {
@@ -313,6 +322,12 @@ def init():
             "date_format": "%Y-%m-%d",
             "max_name_width": 60,
         },
+        "mcp": {
+            "host": "0.0.0.0",
+            "port": 8321,
+            "mode": "readonly",
+            "stateful": False,
+        },
     }
 
     with open(CONFIG_FILE, "w") as f:
@@ -336,9 +351,8 @@ def scan():
     log = []
     try:
         result = mr_core.engine_scan(config, log=log)
-    except DestructiveOperation as e:
-        console.print(f"[red]{e}[/red]")
-        return
+    except (MrError, DestructiveOperation) as e:
+        sys.exit(_handle_engine_error(e))
     for line in log:
         console.print(line)
     console.print(
@@ -482,7 +496,7 @@ def show(model):
 def rate(model):
     """Interactively rate a model (1-5), set status, add optional note."""
     config = load_config()
-    row = resolve_model_interactive(config, model)
+    row, idx = resolve_model_interactive(config, model)
 
     console.print(f"\n[bold]Rating:[/bold] {row['display_name']}")
     if row["rating"]:
@@ -498,7 +512,7 @@ def rate(model):
 
     try:
         result = mr_core.engine_rate(
-            config, name=row["display_name"], rating=new_rating,
+            config, name=model, index=idx, rating=new_rating,
             status=new_status, note=note_text or None,
         )
     except (MrError, DestructiveOperation) as e:
@@ -515,9 +529,9 @@ def rate(model):
 def status(model, status):
     """Set a model's status without requiring a rating."""
     config = load_config()
-    row = resolve_model_interactive(config, model)
+    row, idx = resolve_model_interactive(config, model)
     try:
-        mr_core.engine_status(config, name=row["display_name"], status=status)
+        mr_core.engine_status(config, name=model, status=status, index=idx)
     except (MrError, DestructiveOperation) as e:
         sys.exit(_handle_engine_error(e))
     console.print(f"[green]✓ Status set to: {status}[/green]")
@@ -532,10 +546,10 @@ def status(model, status):
 def note(model, text):
     """Append a timestamped note to a model."""
     config = load_config()
-    row = resolve_model_interactive(config, model)
+    row, idx = resolve_model_interactive(config, model)
     note_text = " ".join(text) if text else click.prompt("Note")
     try:
-        mr_core.engine_note(config, name=row["display_name"], text=note_text)
+        mr_core.engine_note(config, name=model, text=note_text, index=idx)
     except (MrError, DestructiveOperation) as e:
         sys.exit(_handle_engine_error(e))
     console.print("[green]✓ Note added.[/green]")
@@ -549,9 +563,9 @@ def note(model, text):
 def touch(model):
     """Update last_used to now (use when you ran a model outside this tool)."""
     config = load_config()
-    row = resolve_model_interactive(config, model)
+    row, idx = resolve_model_interactive(config, model)
     try:
-        mr_core.engine_touch(config, name=row["display_name"])
+        mr_core.engine_touch(config, name=model, index=idx)
     except (MrError, DestructiveOperation) as e:
         sys.exit(_handle_engine_error(e))
     console.print(f"[green]✓ last_used updated for {row['display_name']}[/green]")
@@ -614,9 +628,8 @@ def enrich(enrich_all):
     log = []
     try:
         result = mr_core.engine_enrich(config, enrich_all=enrich_all, log=log)
-    except DestructiveOperation as e:
-        console.print(f"[red]{e}[/red]")
-        return
+    except (MrError, DestructiveOperation) as e:
+        sys.exit(_handle_engine_error(e))
     for line in log:
         console.print(line)
     console.print(
@@ -642,8 +655,6 @@ def pull(ref, variant, backend, file_pattern, subdir, enrich_filename):
 
     For ComfyUI models, --subdir is required. Supports HuggingFace repos
     (org/repo format) and CivitAI downloads (civitai:<versionId> or CivitAI URL).
-
-    Returns True on success, False on failure.
     """
     config = load_config()
 
@@ -690,9 +701,10 @@ def pull(ref, variant, backend, file_pattern, subdir, enrich_filename):
             if progress is not None:
                 progress.stop()
 
+    overrides: dict = {}
     while True:
         try:
-            _run()
+            _run(**overrides)
             return
         except MrError as e:
             if e.details.get("kind") == "gguf_multi":
@@ -701,26 +713,27 @@ def pull(ref, variant, backend, file_pattern, subdir, enrich_filename):
                 for i, f in enumerate(files, 1):
                     console.print(f"  {i}. {f}")
                 if click.confirm("Download all GGUF files to a subdirectory?", default=True):
-                    _run(download_all=True)
-                    return
+                    overrides = {"download_all": True}
+                    continue
                 user_pattern = click.prompt("Enter pattern (e.g., *Q4_K_M*)")
-                _run(file_pattern=user_pattern)
-                return
+                overrides = {"file_pattern": user_pattern}
+                continue
             if e.details.get("kind") == "comfyui_hf_multi":
                 files = e.details["files"]
                 console.print(f"Multiple model files in [bold]{ref}[/bold]:")
                 for i, f in enumerate(files, 1):
                     console.print(f"  {i}. {f}")
                 idx = click.prompt("Pick a number", type=click.IntRange(1, len(files)))
-                _run(file_pattern=files[idx - 1])
-                return
+                overrides = {"file_pattern": files[idx - 1]}
+                continue
             if "blacklisted" in str(e) and "allow_blacklisted" in str(e):
                 if not click.confirm("Model is BLACKLISTED. Proceed anyway?", default=False):
                     return
-                _run(allow_blacklisted=True)
-                return
+                overrides = {"allow_blacklisted": True}
+                continue
             if "subdir is required" in str(e):
                 subdir = click.prompt("ComfyUI subdir (e.g. checkpoints, loras, vae)")
+                overrides = {"subdir": subdir}
                 continue
             console.print(f"[red]Error: {e}[/red]")
             return
@@ -735,9 +748,9 @@ def pull(ref, variant, backend, file_pattern, subdir, enrich_filename):
 def tag(model, tags):
     """Add tags to a model. Multiple tags can be provided."""
     config = load_config()
-    row = resolve_model_interactive(config, model)
+    row, idx = resolve_model_interactive(config, model)
     try:
-        result = mr_core.engine_tag(config, name=row["display_name"], tags=list(tags))
+        result = mr_core.engine_tag(config, name=model, tags=list(tags), index=idx)
     except (MrError, DestructiveOperation) as e:
         sys.exit(_handle_engine_error(e))
     console.print(f"[green]✓ Tags updated: {', '.join(result['tags'])}[/green]")
@@ -749,9 +762,9 @@ def tag(model, tags):
 def untag(model, tags):
     """Remove tags from a model. If no tags provided, removes all tags."""
     config = load_config()
-    row = resolve_model_interactive(config, model)
+    row, idx = resolve_model_interactive(config, model)
     try:
-        result = mr_core.engine_untag(config, name=row["display_name"], tags=list(tags))
+        result = mr_core.engine_untag(config, name=model, tags=list(tags), index=idx)
     except (MrError, DestructiveOperation) as e:
         sys.exit(_handle_engine_error(e))
     if result["tags"]:
@@ -802,9 +815,8 @@ def restore(dry_run):
     log = []
     try:
         plan = mr_core.engine_restore(config, dry_run=True, confirm=False, log=log)
-    except DestructiveOperation as e:
-        console.print(f"[yellow]{e}[/yellow]")
-        return
+    except (MrError, DestructiveOperation) as e:
+        sys.exit(_handle_engine_error(e))
 
     for line in log:
         console.print(line)
@@ -819,7 +831,10 @@ def restore(dry_run):
         return
 
     log.clear()
-    final = mr_core.engine_restore(config, dry_run=False, confirm=True, log=log)
+    try:
+        final = mr_core.engine_restore(config, dry_run=False, confirm=True, log=log)
+    except (MrError, DestructiveOperation) as e:
+        sys.exit(_handle_engine_error(e))
     for line in log:
         console.print(line)
     console.rule()
@@ -844,37 +859,23 @@ def copy(src_backend, dst_backend, model_name):
     Example: mr copy llamaserver llamacpp Gembrain
     """
     config = load_config()
-    conn = mr_core.get_db(config)
-    mr_core.init_db(conn)
-    try:
-        rows = conn.execute(
-            """SELECT * FROM models
-               WHERE display_name LIKE ? AND backend=?
-               ORDER BY display_name""",
-            (f"%{model_name}%", src_backend),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    if not rows:
-        console.print(f"[red]Model '{model_name}' not found in backend '{src_backend}'[/red]")
-        return
-    if len(rows) > 1:
-        console.print(f"[yellow]Multiple models match '{model_name}' in '{src_backend}':[/yellow]")
-        for i, r in enumerate(rows, 1):
-            console.print(f"  {i}. {r['display_name']}")
-        choice = click.prompt("Pick a number", type=click.IntRange(1, len(rows)))
-        chosen = rows[choice - 1]
-    else:
-        chosen = rows[0]
-
-    try:
-        result = mr_core.engine_copy(
-            config, src_backend=src_backend, dst_backend=dst_backend,
-            model_name=chosen["display_name"], confirm=True,
-        )
-    except (MrError, DestructiveOperation) as e:
-        sys.exit(_handle_engine_error(e))
+    index = None
+    while True:
+        try:
+            result = mr_core.engine_copy(
+                config, src_backend=src_backend, dst_backend=dst_backend,
+                model_name=model_name, confirm=True, index=index,
+            )
+            break
+        except AmbiguousModel as e:
+            console.print(
+                f"[yellow]Multiple models match '{model_name}' in '{src_backend}':[/yellow]"
+            )
+            for i, m in enumerate(e.matches, 1):
+                console.print(f"  {i}. {m['display_name']}  [dim]{m.get('file_path')}[/dim]")
+            index = click.prompt("Pick a number", type=click.IntRange(1, len(e.matches))) - 1
+        except (MrError, DestructiveOperation) as e:
+            sys.exit(_handle_engine_error(e))
     console.print(f"[green]✓ Copied to {result['display_name']} ({result['size_gb']:.2f} GB). Registry updated.[/green]")
 
 
@@ -892,9 +893,9 @@ def rename(model, new_name):
     and enriches the new name with CivitAI metadata when available.
     """
     config = load_config()
-    row = resolve_model_interactive(config, model)
+    row, idx = resolve_model_interactive(config, model)
     try:
-        result = mr_core.engine_rename(config, name=row["display_name"], new_name=new_name, confirm=True)
+        result = mr_core.engine_rename(config, name=model, new_name=new_name, confirm=True, index=idx)
     except (MrError, DestructiveOperation) as e:
         if "not found on disk" in str(e):
             console.print(f"[yellow]{e}[/yellow]")
@@ -912,13 +913,19 @@ def rename(model, new_name):
 def delete(model):
     """Delete a model from Ollama or disk. Keeps DB record, sets status=deleted."""
     config = load_config()
-    row = resolve_model_interactive(config, model)
+    row, idx = resolve_model_interactive(config, model)
     if not click.confirm(f"Delete '{row['display_name']}'?", default=False):
         return
     try:
-        result = mr_core.engine_delete(config, name=row["display_name"], confirm=True)
+        result = mr_core.engine_delete(config, name=model, confirm=True, index=idx)
     except (MrError, DestructiveOperation) as e:
         sys.exit(_handle_engine_error(e))
+    if row["currently_local"] and not result["file_removed"]:
+        console.print(
+            "[yellow]⚠ Registry updated (status=deleted), but the file could not be "
+            f"removed from disk: {row['file_path']}[/yellow]"
+        )
+        return
     console.print("[green]✓ Registry updated (status=deleted).[/green]")
 
 
@@ -927,11 +934,11 @@ def delete(model):
 def remove(model):
     """Remove a model from the registry (hard delete). Completely removes the DB entry."""
     config = load_config()
-    row = resolve_model_interactive(config, model)
+    row, idx = resolve_model_interactive(config, model)
     if not click.confirm(f"Delete '{row['display_name']}' from registry?", default=False):
         return
     try:
-        mr_core.engine_remove(config, name=row["display_name"], confirm=True)
+        mr_core.engine_remove(config, name=model, confirm=True, index=idx)
     except (MrError, DestructiveOperation) as e:
         sys.exit(_handle_engine_error(e))
     console.print("[green]✓ Model deleted from registry.[/green]")
@@ -949,17 +956,22 @@ def blacklist(model, reason):
     config = load_config()
     reason_text = " ".join(reason) if reason else None
 
+    row = None
+    idx = None
     conn = mr_core.get_db(config)
     mr_core.init_db(conn)
     try:
         try:
             row = mr_core.resolve_model(conn, model)
+            idx = 0
         except AmbiguousModel as e:
             console.print(f"[yellow]Multiple models match '{model}':[/yellow]")
             for i, m in enumerate(e.matches, 1):
-                console.print(f"  {i}. {m['display_name']}  [{m['backend']}]")
+                path = f"  [dim]{m['file_path']}[/dim]" if m["file_path"] else ""
+                console.print(f"  {i}. {m['display_name']}  [{m['backend']}]{path}")
             choice = click.prompt("Pick a number", type=click.IntRange(1, len(e.matches)))
             row = mr_core.resolve_model(conn, model, index=choice - 1)
+            idx = choice - 1
         except ModelNotFound:
             row = None
     finally:
@@ -976,10 +988,10 @@ def blacklist(model, reason):
     if reason_text is None:
         reason_text = click.prompt("Reason for blacklisting")
 
-    resolved_name = row["display_name"] if row is not None else model
     try:
         result = mr_core.engine_blacklist(
-            config, name=resolved_name, reason=reason_text, backend=backend, confirm=True
+            config, name=model, reason=reason_text, backend=backend,
+            confirm=True, index=idx,
         )
     except (MrError, DestructiveOperation) as e:
         sys.exit(_handle_engine_error(e))
