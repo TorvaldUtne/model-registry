@@ -7,12 +7,10 @@ __pycache__/
 *.pyo
 .env
 *.code-workspace
-.claude/
-AGENTS.md
 
-# Exclude planning/notes docs but keep CLAUDE.md and README.md
+# Exclude planning/notes docs but keep AGENTS.md and README.md
 *.md
-!CLAUDE.md
+!AGENTS.md
 !README.md
 
 # Exclude text files but keep requirements.txt and requirements-dev.txt
