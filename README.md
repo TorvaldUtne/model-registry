@@ -1,4 +1,4 @@
-# mr — Model Registry v1.4.0
+# mr — Model Registry v1.5.0
 
 A CLI + MCP server for tracking, rating, and managing AI models across three local backends: **Ollama** (via Docker), **llama.cpp** (`.gguf` files), and **ComfyUI** (`.safetensors`, `.ckpt`, etc.). State is stored in a local SQLite database.
 
@@ -18,19 +18,20 @@ Three files, one engine:
 - Cross-backend duplicate detection (same `hf_repo` on multiple backends)
 - Audit log: every mutating operation is recorded in an `events` table
 - Model tagging system for custom categorization
-- Copy models between backends
+- Copy models between GGUF backends
+- Restore missing ComfyUI models from their recorded source
 - Automatic directory flattening for HuggingFace downloads
 
 ## Requirements
 
 - Python 3.10+
 - Docker (for the Ollama backend)
-- pip packages: `click`, `rich`, `requests`, `huggingface_hub`, `mcp[streamable-http]`
+- pip packages: `click`, `rich`, `requests`, `huggingface_hub`, `gguf`, `mcp[streamable-http]` (see `requirements.txt`)
 
 ## Installation
 
 ```bash
-git clone https://github.com/yourname/model-registry.git
+git clone https://github.com/TorvaldUtne/model-registry.git
 cd model-registry
 python -m venv venv
 # Windows
@@ -184,14 +185,15 @@ export CIVITAI_API_KEY=...      # CivitAI (required for gated models)
 | `touch MODEL` | Mark `last_used = now` (for tracking use outside this tool). |
 | `report` | Summary: totals by backend/status, unrated list, blacklisted list, cross-backend duplicates. |
 | `pull REF [VARIANT]` | Download a model and register it. See below. |
-| `rename MODEL NEW_NAME` | Rename the directory containing a model on disk and update the registry entry. File name remains unchanged. |
+| `rename MODEL NEW_NAME` | For GGUF backends, renames the directory containing the model (file name unchanged). For ComfyUI, renames the file in place (subdir stays put) and enriches the new name with CivitAI metadata when available. |
 | `delete MODEL` | Remove a model from Ollama or disk; DB record is kept with `status=deleted`. |
 | `remove MODEL` | Hard delete a model from the registry (completely removes DB entry). |
 | `removeall` | Purge all models with status='deleted' from the registry (hard delete). |
 | `tag MODEL TAGS...` | Add one or more tags to a model. |
 | `untag MODEL [TAGS...]` | Remove specific tags or all tags if none provided. |
 | `backends` | List configured backend names with their status. |
-| `copy SRC_BACKEND DST_BACKEND MODEL_NAME` | Copy a model from one backend to another. |
+| `copy SRC_BACKEND DST_BACKEND MODEL_NAME` | Copy a model between GGUF backends (Ollama/ComfyUI are rejected). |
+| `restore` | Re-download all missing ComfyUI models that have a known source. `--dry-run` to preview. |
 | `blacklist MODEL [REASON]` | Blacklist and auto-delete a model. Future pulls warn before proceeding. |
 | `enrich` | Fetch HuggingFace and CivitAI metadata for all registered models. Unenriched ComfyUI files are also matched on CivitAI by SHA-256 hash. |
 | `search TERM` | Search registry by name, HF repo, notes, or tags. |
@@ -222,7 +224,7 @@ Backend is auto-detected from the ref format:
 | CivitAI version ID | `civitai:12345` | comfyui |
 | CivitAI URL | `https://civitai.com/models/1234?modelVersionId=5678` | comfyui |
 
-Use `--backend` to override auto-detection. For ComfyUI downloads, `--subdir` selects the destination subdirectory (e.g. `checkpoints`, `loras`, `vae`). The subdir is auto-detected from AIR tags and the CivitAI API when possible.
+Use `--backend` to override auto-detection. For ComfyUI downloads, `--subdir` is required (e.g. `checkpoints`, `loras`, `vae`); it is auto-detected from AIR tags, the HF file path, and the CivitAI API when possible, and the command fails with a clear error when it cannot be determined. `--rename` saves CivitAI pulls under a metadata-rich name (name + version + base model + fp + CivitAI id) instead of the upstream filename.
 
 ```bash
 # Force a HF repo into ComfyUI/loras
@@ -269,13 +271,22 @@ Tags appear in `mr list` and `mr show` output, and can be searched:
 python mr.py search RP
 ```
 
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+The suite runs entirely against a temporary SQLite database and temporary model directories, so it never touches your real registry or model files.
+
 ## Version
 
-Run `mr` without arguments to see the current version:
+The version lives in `mr_core.__version__` (re-exported by `mr.py`). Run `mr` without arguments to see it:
 
 ```bash
 $ mr
-Model Registry v1.1.0
+Model Registry v1.5.0
 Run mr --help for available commands.
 ```
 
@@ -285,11 +296,15 @@ MIT — see [LICENSE](LICENSE).
 
 ## Changelog
 
-### Unreleased
-- `mr enrich` now matches unenriched ComfyUI files on CivitAI by SHA-256 hash, backfilling provenance (`source_url`/`source_type`), base model, and trigger words. Add new `file_hash`/`hash_checked` columns (unmatched files are cached to avoid re-lookups; `--all` re-checks).
+### v1.5.0
+- `mr enrich` now matches unenriched ComfyUI files on CivitAI by SHA-256 hash, backfilling provenance (`source_url`/`source_type`), base model, and trigger words. Adds `file_hash`/`hash_checked` columns; unmatched files are cached so they aren't re-looked-up (`--all` re-checks).
 - CivitAI browse links are configurable: `civitai.web_host` (default `civitai.red`; `civitai.green` is SFW-only) and `civitai.api_host` (default `civitai.com`).
-- `mr rename` / model resolution now tolerate a filename passed with its extension (`foo.safetensors` → `foo`).
-- `mr pull --backend comfyui` auto-detects the ComfyUI subdir from the repo file path (e.g. `loras/foo.safetensors`, `text_encoders/...`) and no longer nests `models/loras/loras/foo`; meaningful extra folders (e.g. `loras/author/foo`) are preserved.
+- `mr rename` for ComfyUI now renames the file in place (subdir stays put) and enriches the new name with CivitAI metadata; GGUF backends still rename the containing directory. Model resolution tolerates a filename passed with its extension (`foo.safetensors` → `foo`).
+- `mr pull --backend comfyui` auto-detects the subdir from the repo file path or CivitAI file type and no longer nests `models/loras/loras/foo`; meaningful extra folders (e.g. `loras/author/foo`) are preserved. Bundled multi-version AIR tags (`civitai:ID@VER+VER2`) are supported.
+- CivitAI pull fixes: correct file id selection, subdir, trigger-word capture, and sanitized filenames; HF pulls show per-file download progress.
+- MCP transport is stateless by default (`stateful: false`), so a stale or expired `mcp-session-id` can never cause a hard `404`; pass `--stateful` (or `"stateful": true`) to opt back in.
+- Scan fixes: ComfyUI duplicate detection, no re-fetching of known GGUF context windows, and no no-op `scan_updated` events when nothing changed.
+- Fixed a batch of silent-wrong-behavior bugs across the engine, CLI, and MCP server; added a pytest suite under `tests/`.
 
 ### v1.4.0
 - New architecture: engine extracted to `mr_core.py`; `mr.py` is the CLI; added `mr_mcp.py`, an MCP (Streamable HTTP) server for agent access over the LAN.

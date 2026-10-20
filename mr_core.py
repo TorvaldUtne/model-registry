@@ -118,7 +118,7 @@ STATUS_COLORS = {
     "favorite": "magenta",
 }
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
